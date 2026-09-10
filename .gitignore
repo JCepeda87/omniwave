@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+venv/
+.env
+
+# Runtime state, not source
+config.json
+omniwave_history.db
