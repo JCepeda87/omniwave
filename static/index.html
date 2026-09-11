@@ -111,11 +111,12 @@
     <h2>Add device</h2>
     <form class="add-device" id="addForm">
       <input name="ip" placeholder="192.168.1.50" required>
-      <select name="brand">
+      <select name="brand" id="brandSelect">
         <option value="shure">Shure</option>
         <option value="sennheiser">Sennheiser</option>
       </select>
-      <input name="type" placeholder="type (e.g. axtd)" value="axtd">
+      <select name="type" id="typeSelect"></select>
+      <input name="typeCustom" id="typeCustom" placeholder="model name" style="display:none">
       <button type="submit">Add device</button>
     </form>
   </div>
@@ -132,6 +133,61 @@ const devicesEl = document.getElementById('devices');
 const spectrumCache = {};
 const liveScans = {}; // ip -> interval id, only present while live-scanning
 const LIVE_SCAN_INTERVAL_MS = 1500;
+
+// Curated pool of current wireless mic/IEM systems per brand, for the
+// "type" picker when adding a device. value = short type tag stored in
+// config.json / providers, label = model name shown in the dropdown.
+const DEVICE_MODELS = {
+  shure: [
+    ['axient-digital', 'Axient Digital (AD Series)'],
+    ['ulxd', 'ULX-D'],
+    ['qlxd', 'QLX-D'],
+    ['slxd-plus', 'SLX-D+'],
+    ['glxd-plus', 'GLX-D+ (Dual Band)'],
+    ['blx', 'BLX / BLX+'],
+    ['uhf-r', 'UHF-R'],
+    ['psm1000', 'PSM1000 (IEM)'],
+    ['psm900', 'PSM900 (IEM)'],
+    ['psm300', 'PSM300 (IEM)'],
+    ['mxw', 'MXW (Microflex Wireless)'],
+    ['custom', 'Other / custom model...'],
+  ],
+  sennheiser: [
+    ['digital9000', 'Digital 9000'],
+    ['digital6000', 'Digital 6000'],
+    ['ewdx', 'EW-DX'],
+    ['ewd', 'EW-D'],
+    ['ew-g4', 'evolution wireless G4 (100/300/500)'],
+    ['xswd', 'XSW-D'],
+    ['xsw-iem', 'XSW IEM'],
+    ['series2000', '2000 Series (SK/SKM/SR 2000)'],
+    ['avx', 'AVX'],
+    ['sl', 'SpeechLine Digital Wireless (SL)'],
+    ['spectera', 'Spectera'],
+    ['custom', 'Other / custom model...'],
+  ],
+};
+
+const brandSelect = document.getElementById('brandSelect');
+const typeSelect = document.getElementById('typeSelect');
+const typeCustom = document.getElementById('typeCustom');
+
+function populateModelOptions() {
+  const models = DEVICE_MODELS[brandSelect.value] || [];
+  typeSelect.innerHTML = models.map(([value, label]) =>
+    `<option value="${value}">${label}</option>`).join('');
+  updateCustomVisibility();
+}
+
+function updateCustomVisibility() {
+  const isCustom = typeSelect.value === 'custom';
+  typeCustom.style.display = isCustom ? '' : 'none';
+  typeCustom.required = isCustom;
+}
+
+brandSelect.addEventListener('change', populateModelOptions);
+typeSelect.addEventListener('change', updateCustomVisibility);
+populateModelOptions();
 
 function renderSpectrum(spectrum) {
   if (!spectrum || !spectrum.length) return '';
@@ -222,15 +278,17 @@ async function removeDevice(ip) {
 document.getElementById('addForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
+  const type = fd.get('type') === 'custom' ? fd.get('typeCustom') : fd.get('type');
   await fetch('/devices', {
     method: 'POST',
     body: JSON.stringify({
       ip: fd.get('ip'),
       brand: fd.get('brand'),
-      type: fd.get('type'),
+      type: type,
     }),
   });
   e.target.reset();
+  populateModelOptions();
   refresh();
 });
 
