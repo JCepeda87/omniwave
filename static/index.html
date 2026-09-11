@@ -96,6 +96,13 @@
   .alerts { font-size: 12px; color: var(--warn); margin: 6px 0; }
   .device-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
   .empty { color: var(--muted); font-size: 13px; padding: 20px; text-align: center; }
+  .discovery-controls { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .discovery-results { display: flex; flex-direction: column; gap: 8px; }
+  .discovery-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+  }
+  .discovery-row .device-ip { font-weight: 600; font-size: 13px; }
   .spectrum {
     display: flex; align-items: flex-end; gap: 1px; height: 40px;
     margin-top: 8px; background: var(--bg); border-radius: 6px; padding: 4px;
@@ -119,6 +126,19 @@
       <input name="typeCustom" id="typeCustom" placeholder="model name" style="display:none">
       <button type="submit">Add device</button>
     </form>
+  </div>
+
+  <div class="panel">
+    <h2>Auto Discovery</h2>
+    <div class="device-meta" style="margin-bottom:10px">
+      Probes your local network for hosts responding on known Shure (2202) / Sennheiser SSC (45) control ports.
+      This is a heuristic port scan, not the brands' certified SLP/mDNS discovery.
+    </div>
+    <div class="discovery-controls">
+      <button id="scanBtn" class="secondary" onclick="scanNetwork()">Scan Network</button>
+      <span class="device-meta" id="scanStatus"></span>
+    </div>
+    <div class="discovery-results" id="discoveryResults"></div>
   </div>
 
   <div class="panel">
@@ -188,6 +208,53 @@ function updateCustomVisibility() {
 brandSelect.addEventListener('change', populateModelOptions);
 typeSelect.addEventListener('change', updateCustomVisibility);
 populateModelOptions();
+
+function modelOptionsHtml(brand) {
+  const models = DEVICE_MODELS[brand] || DEVICE_MODELS.shure;
+  return models.map(([value, label]) => `<option value="${value}">${label}</option>`).join('');
+}
+
+async function scanNetwork() {
+  const btn = document.getElementById('scanBtn');
+  const status = document.getElementById('scanStatus');
+  const resultsEl = document.getElementById('discoveryResults');
+  btn.disabled = true;
+  status.textContent = 'Scanning local network...';
+  resultsEl.innerHTML = '';
+  try {
+    const res = await fetch('/discover').then(r => r.json());
+    const candidates = res.candidates || [];
+    if (!candidates.length) {
+      resultsEl.innerHTML = '<div class="empty">No candidates found on the local network.</div>';
+    } else {
+      resultsEl.innerHTML = candidates.map((c, i) => `
+        <div class="discovery-row">
+          <div>
+            <div class="device-ip">${c.ip}</div>
+            <div class="device-meta">${c.brand} · port ${c.port} open</div>
+          </div>
+          <select id="discModel-${i}">${modelOptionsHtml(c.brand)}</select>
+          <button onclick="addDiscovered('${c.ip}', '${c.brand}', ${i})">Add</button>
+        </div>`).join('');
+    }
+    status.textContent = `Found ${candidates.length} candidate(s).`;
+  } catch (e) {
+    status.textContent = 'Scan failed.';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function addDiscovered(ip, brand, idx) {
+  const select = document.getElementById('discModel-' + idx);
+  const type = select ? select.value : 'custom';
+  await fetch('/devices', {
+    method: 'POST',
+    body: JSON.stringify({ ip, brand, type }),
+  });
+  refresh();
+  scanNetwork();
+}
 
 function renderSpectrum(spectrum) {
   if (!spectrum || !spectrum.length) return '';

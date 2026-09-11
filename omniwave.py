@@ -4,10 +4,13 @@ import logging
 import json
 import os
 import sys
+import socket
+import ipaddress
 import sqlite3
 import hmac
 import requests
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from tornado.ioloop import IOLoop
 from tornado.web import Application, RequestHandler
 from providers import ShureProvider, SennheiserProvider
@@ -200,6 +203,59 @@ class DeviceHandler(RequestHandler):
         else:
             self.set_status(404)
 
+# Heuristic auto-discovery: probe the local /24 subnet for hosts with a
+# known brand control port open. This is NOT the brands' certified
+# discovery protocols (Shure uses Multicast SLP on 239.255.254.253 and
+# also supports mDNS; Sennheiser Control Cockpit uses mDNS/DNS-SD with
+# service type "_ssc") -- it's a best-effort port probe so discovery
+# works without an extra mDNS/SLP dependency. Ports match what the
+# providers already use/assume: 2202 for Shure, 45 for Sennheiser SSC.
+DISCOVERY_PORTS = {
+    2202: 'shure',
+    45: 'sennheiser',
+}
+DISCOVERY_TIMEOUT = 0.3
+DISCOVERY_MAX_WORKERS = 128
+
+def get_local_subnet():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('8.8.8.8', 80))
+        local_ip = s.getsockname()[0]
+    finally:
+        s.close()
+    return ipaddress.ip_network(local_ip + '/24', strict=False)
+
+def probe_host(ip, port):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(DISCOVERY_TIMEOUT)
+            return s.connect_ex((ip, port)) == 0
+    except OSError:
+        return False
+
+def scan_subnet():
+    """Blocking; call via an executor so it doesn't stall the IOLoop."""
+    network = get_local_subnet()
+    hosts = list(network.hosts())
+    found = []
+    with ThreadPoolExecutor(max_workers=DISCOVERY_MAX_WORKERS) as pool:
+        futures = {}
+        for host in hosts:
+            for port, brand in DISCOVERY_PORTS.items():
+                futures[pool.submit(probe_host, str(host), port)] = (str(host), port, brand)
+        for future in futures:
+            if future.result():
+                ip, port, brand = futures[future]
+                found.append({'ip': ip, 'brand': brand, 'port': port})
+    return found
+
+class DiscoverHandler(RequestHandler):
+    async def get(self):
+        candidates = await IOLoop.current().run_in_executor(None, scan_subnet)
+        candidates = [c for c in candidates if c['ip'] not in Devices]
+        self.write(json.dumps({'candidates': candidates}))
+
 def poll_devices():
     for ip, dev in Devices.items():
         dev.poll()
@@ -239,6 +295,7 @@ def main():
         (r'/stream', StreamHandler),
         (r'/system/update', UpdateHandler),
         (r'/devices', DeviceHandler),
+        (r'/discover', DiscoverHandler),
         (r'/static/(.*)', StaticHandler),
     ])
     app.listen(9000, address='0.0.0.0')
