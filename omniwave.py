@@ -4,6 +4,7 @@ import logging
 import json
 import os
 import sys
+import re
 import socket
 import ipaddress
 import sqlite3
@@ -279,6 +280,91 @@ class DiscoverHandler(RequestHandler):
         candidates = [c for c in candidates if c['ip'] not in Devices]
         self.write(json.dumps({'candidates': candidates}))
 
+# --- Frequency plan / scan import -----------------------------------------
+# Shure and Sennheiser's native show-file formats (.wwb, .show) are
+# undocumented proprietary containers, so this parses the interchange
+# formats both brands actually document/support instead:
+#   - Sennheiser WSM frequency list CSV (semicolon-delimited):
+#       name;type;frequency_kHz;tolerance;lower;upper;priority;noise_level
+#   - Sennheiser WSM wideband scan CSV export: 7 header rows ending in the
+#     column row ['Frequency','RF level (%)','RF level','Memory (%)',
+#     'Memory','Squelch (%)','Squelch'], then one data row per scan point.
+#   - Shure WWB frequency list: plain frequencies in MHz (<=3 decimals)
+#     separated by comma, tab, or newline -- no name/header fields.
+WSM_SCAN_HEADER = ['Frequency', 'RF level (%)', 'RF level', 'Memory (%)', 'Memory', 'Squelch (%)', 'Squelch']
+
+def parse_wsm_scan(rows):
+    header_idx = next((i for i, row in enumerate(rows) if row == WSM_SCAN_HEADER), None)
+    if header_idx is None:
+        return None
+    spectrum = []
+    for row in rows[header_idx + 1:]:
+        if len(row) < 3:
+            continue
+        raw_freq, raw_level = row[0].strip(), row[2].strip()
+        if not raw_freq.isdigit():
+            continue
+        try:
+            freq_mhz = float(raw_freq[:3] + '.' + raw_freq[3:]) if len(raw_freq) > 3 else float(raw_freq)
+            level = float(raw_level)
+        except ValueError:
+            continue
+        spectrum.append([round(freq_mhz, 3), level])
+    return spectrum or None
+
+def parse_wsm_frequency_list(rows):
+    entries = []
+    for row in rows:
+        if len(row) < 3:
+            continue
+        name, dtype, freq_raw = row[0].strip(), row[1].strip(), row[2].strip()
+        try:
+            freq_khz = float(freq_raw)
+        except ValueError:
+            continue
+        entries.append({'name': name or None, 'type': dtype or None, 'frequency_mhz': round(freq_khz / 1000, 4)})
+    return entries or None
+
+def parse_wwb_frequency_list(text):
+    entries = []
+    for token in re.split(r'[,\t\r\n]+', text):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            freq = float(token)
+        except ValueError:
+            continue
+        if 20 <= freq <= 7000:  # sane RF range in MHz; filters out stray non-frequency numbers
+            entries.append({'name': None, 'type': None, 'frequency_mhz': round(freq, 3)})
+    return entries or None
+
+class ImportHandler(RequestHandler):
+    def post(self):
+        upload = self.request.files.get('file')
+        if not upload:
+            self.set_status(400)
+            self.write(json.dumps({'error': 'file is required'}))
+            return
+        raw = upload[0]['body'].decode('utf-8', errors='ignore')
+        rows = [line.split(';') for line in raw.splitlines() if line.strip()]
+
+        scan = parse_wsm_scan(rows)
+        if scan is not None:
+            self.write(json.dumps({'format': 'wsm_scan', 'spectrum': scan}))
+            return
+        freq_list = parse_wsm_frequency_list(rows)
+        if freq_list is not None:
+            self.write(json.dumps({'format': 'wsm_frequency_list', 'frequencies': freq_list}))
+            return
+        wwb_list = parse_wwb_frequency_list(raw)
+        if wwb_list is not None:
+            self.write(json.dumps({'format': 'wwb_frequency_list', 'frequencies': wwb_list}))
+            return
+
+        self.set_status(422)
+        self.write(json.dumps({'error': "Couldn't recognize this as a WSM or WWB frequency file."}))
+
 _last_webhook_sent = {}
 WEBHOOK_COOLDOWN_SECONDS = 60
 
@@ -332,6 +418,7 @@ def main():
         (r'/devices', DeviceHandler),
         (r'/devices/rename', RenameHandler),
         (r'/discover', DiscoverHandler),
+        (r'/import', ImportHandler),
         (r'/static/(.*)', StaticHandler),
     ])
     app.listen(9000, address='0.0.0.0')

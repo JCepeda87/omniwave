@@ -184,6 +184,11 @@
   .history-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
   .history-grid .device-meta { text-align: center; margin-bottom: 2px; }
   .history-grid svg { display: block; }
+
+  .freq-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  .freq-table th, .freq-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  .freq-table th { color: var(--muted); font-size: 11px; text-transform: uppercase; font-weight: 600; }
+  .freq-table tbody tr:hover { background: var(--bg); }
 </style>
 </head>
 <body>
@@ -233,6 +238,19 @@
         <span class="device-meta" id="scanStatus"></span>
       </div>
       <div class="discovery-results" id="discoveryResults"></div>
+
+      <h2 style="margin-top:20px">Import Frequency Plan</h2>
+      <div class="device-meta" style="margin-bottom:10px">
+        Imports the documented interchange formats: a Sennheiser WSM frequency-list or wideband-scan CSV export,
+        or a Shure WWB plain-text frequency list. Native .wwb / .show project files are undocumented proprietary
+        formats and aren't supported — export a CSV/TXT frequency list or scan from WSM/WWB instead.
+      </div>
+      <form id="importForm" class="add-device">
+        <input type="file" name="file" id="importFile" accept=".csv,.txt" required>
+        <button type="submit">Import</button>
+      </form>
+      <div class="device-meta" id="importStatus" style="margin-top:8px"></div>
+      <div id="importResults"></div>
     </div>
   </details>
 
@@ -564,6 +582,50 @@ document.getElementById('addForm').addEventListener('submit', async (e) => {
   e.target.reset();
   populateModelOptions();
   refresh();
+});
+
+function renderImportResults(data) {
+  const el = document.getElementById('importResults');
+  if (data.format === 'wsm_scan') {
+    el.innerHTML = `<div class="spectrum" style="height:60px">${renderSpectrum(data.spectrum)}</div>`;
+    return;
+  }
+  const rows = data.frequencies || [];
+  if (!rows.length) {
+    el.innerHTML = '<div class="empty">No frequencies found in file.</div>';
+    return;
+  }
+  el.innerHTML = `
+    <table class="freq-table">
+      <thead><tr><th>Name</th><th>Type</th><th>Frequency (MHz)</th></tr></thead>
+      <tbody>${rows.map(r => `<tr><td>${r.name || '—'}</td><td>${r.type || '—'}</td><td>${r.frequency_mhz.toFixed(3)}</td></tr>`).join('')}</tbody>
+    </table>`;
+}
+
+document.getElementById('importForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fileInput = document.getElementById('importFile');
+  const status = document.getElementById('importStatus');
+  const resultsEl = document.getElementById('importResults');
+  if (!fileInput.files.length) return;
+  const fd = new FormData();
+  fd.append('file', fileInput.files[0]);
+  status.textContent = 'Importing...';
+  resultsEl.innerHTML = '';
+  try {
+    const res = await fetch('/import', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) {
+      status.textContent = data.error || 'Import failed.';
+      return;
+    }
+    const formatLabel = { wsm_scan: 'WSM scan', wsm_frequency_list: 'WSM frequency list', wwb_frequency_list: 'WWB frequency list' }[data.format] || data.format;
+    const count = data.format === 'wsm_scan' ? data.spectrum.length : (data.frequencies || []).length;
+    status.textContent = `Imported ${formatLabel} · ${count} ${data.format === 'wsm_scan' ? 'points' : 'entries'}.`;
+    renderImportResults(data);
+  } catch (err) {
+    status.textContent = 'Import failed.';
+  }
 });
 
 refresh();
