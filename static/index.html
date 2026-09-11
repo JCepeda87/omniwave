@@ -302,6 +302,18 @@
       <div id="scanThresholdControls"></div>
       <div class="freq-chip-row" id="scanExclusionChips" style="margin-top:8px"></div>
 
+      <h2 style="margin-top:16px">Manual Exclusions</h2>
+      <div class="device-meta" style="margin-bottom:8px">
+        Avoid a specific frequency or range regardless of scan/TV data — e.g. one reserved for a news crew,
+        or a venue-specific restriction. Leave "To" blank to exclude a single frequency with a small guard band.
+      </div>
+      <form id="manualExclusionForm" class="add-device">
+        <input type="number" step="0.001" id="manualExclFrom" placeholder="From (MHz)" required>
+        <input type="number" step="0.001" id="manualExclTo" placeholder="To (optional)">
+        <button type="submit" class="secondary">Exclude</button>
+      </form>
+      <div class="freq-chip-row" id="manualExclusionChips" style="margin-top:8px"></div>
+
       <h2 style="margin-top:16px">Active Frequencies</h2>
       <div class="device-meta" style="margin-bottom:8px">
         Includes frequencies already assigned to devices below, plus any extra candidates added here (e.g. from an imported plan).
@@ -316,6 +328,13 @@
         <button onclick="checkCoordination()">Check for Conflicts</button>
         <input type="number" id="suggestCount" value="1" min="1" max="50" style="width:60px">
         <button class="secondary" onclick="suggestFrequencies()">Suggest Frequencies</button>
+      </div>
+      <div class="device-meta" style="margin:10px 0">
+        Or, like WWB's own Calculate + Assign &amp; Deploy: recompute clean frequencies for every 🔓 unlocked
+        device below at once (🔒 locked devices keep their frequency and anchor the calculation).
+      </div>
+      <div class="device-actions">
+        <button onclick="calculateAllAndDeploy()">Calculate All &amp; Deploy</button>
       </div>
 
       <div id="coordResults" style="margin-top:14px"></div>
@@ -610,6 +629,7 @@ async function refresh() {
               <div class="device-freq-row device-meta">
                 ${d.frequency_mhz != null ? d.frequency_mhz.toFixed(3) + ' MHz' : 'No frequency assigned'}
                 <button class="icon-btn" title="Assign frequency" onclick="assignDeviceFrequency('${ip}', ${d.frequency_mhz ?? 'null'})">📻</button>
+                <button class="icon-btn" title="${lockedDevices.has(ip) ? 'Unlock (Calculate All will reassign it)' : 'Lock (Calculate All will keep its frequency and anchor around it)'}" onclick="toggleLock('${ip}')">${lockedDevices.has(ip) ? '🔒' : '🔓'}</button>
               </div>
             </div>
           </div>
@@ -730,6 +750,8 @@ const extraFrequencies = [];
 let lastScanSpectrum = null;
 let lastImportedScanSpectrum = null;
 const scanExclusions = [];
+const manualExclusions = [];
+const lockedDevices = new Set();
 
 async function loadRegions() {
   regionsData = await fetch('/regions').then(r => r.json());
@@ -871,6 +893,78 @@ function removeScanExclusion(idx) {
   renderScanExclusionChips();
 }
 
+document.getElementById('manualExclusionForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const fromInput = document.getElementById('manualExclFrom');
+  const toInput = document.getElementById('manualExclTo');
+  const from = parseFloat(fromInput.value);
+  if (isNaN(from)) return;
+  const toVal = parseFloat(toInput.value);
+  const GUARD_MHZ = 0.1;
+  const range = !isNaN(toVal) ? [Math.min(from, toVal), Math.max(from, toVal)] : [from - GUARD_MHZ, from + GUARD_MHZ];
+  manualExclusions.push(range);
+  fromInput.value = '';
+  toInput.value = '';
+  renderManualExclusionChips();
+});
+
+function renderManualExclusionChips() {
+  const el = document.getElementById('manualExclusionChips');
+  el.innerHTML = manualExclusions.length
+    ? manualExclusions.map((r, i) => `<span class="freq-chip">${r[0].toFixed(3)}–${r[1].toFixed(3)} MHz <button class="chip-remove" onclick="removeManualExclusion(${i})">×</button></span>`).join('')
+    : '<div class="empty" style="padding:8px">No manual exclusions yet.</div>';
+}
+
+function removeManualExclusion(idx) {
+  manualExclusions.splice(idx, 1);
+  renderManualExclusionChips();
+}
+
+function allExclusionRanges() {
+  return [...scanExclusions, ...manualExclusions];
+}
+
+function toggleLock(ip) {
+  if (lockedDevices.has(ip)) lockedDevices.delete(ip); else lockedDevices.add(ip);
+  refresh();
+}
+
+async function calculateAllAndDeploy() {
+  const resultsEl = document.getElementById('coordResults');
+  const allIps = Object.keys(lastData);
+  const unlockedIps = allIps.filter(ip => !lockedDevices.has(ip));
+  if (!unlockedIps.length) {
+    resultsEl.innerHTML = '<div class="empty">All devices are locked — nothing to calculate.</div>';
+    return;
+  }
+  resultsEl.innerHTML = `<div class="device-meta">Calculating for ${unlockedIps.length} unlocked device(s)...</div>`;
+  const fixedFreqs = [
+    ...allIps.filter(ip => lockedDevices.has(ip) && lastData[ip].frequency_mhz != null).map(ip => lastData[ip].frequency_mhz),
+    ...extraFrequencies,
+  ];
+  const res = await fetch('/coordination/suggest', {
+    method: 'POST',
+    body: JSON.stringify({
+      region: currentRegion,
+      occupied_channels: [...occupiedChannels],
+      frequencies: fixedFreqs,
+      scan_exclusions: allExclusionRanges(),
+      count: unlockedIps.length,
+    }),
+  }).then(r => r.json());
+
+  const suggested = res.suggested_mhz || [];
+  if (suggested.length < unlockedIps.length) {
+    resultsEl.innerHTML = `<div class="empty">Only found ${suggested.length} clean frequencies for ${unlockedIps.length} device(s) — narrow your exclusions or reduce device count.</div>`;
+    return;
+  }
+  await Promise.all(unlockedIps.map((ip, i) =>
+    fetch('/devices/frequency', { method: 'POST', body: JSON.stringify({ ip, frequency_mhz: suggested[i] }) })
+  ));
+  resultsEl.innerHTML = `<div class="device-meta" style="color:var(--ok)">Deployed ${suggested.length} clean frequencies to ${unlockedIps.length} unlocked device(s).</div>`;
+  refresh();
+}
+
 async function checkCoordination() {
   const resultsEl = document.getElementById('coordResults');
   resultsEl.innerHTML = '<div class="device-meta">Checking...</div>';
@@ -880,7 +974,7 @@ async function checkCoordination() {
       region: currentRegion,
       occupied_channels: [...occupiedChannels],
       frequencies: extraFrequencies,
-      scan_exclusions: scanExclusions,
+      scan_exclusions: allExclusionRanges(),
     }),
   }).then(r => r.json());
 
@@ -902,7 +996,7 @@ async function suggestFrequencies() {
       region: currentRegion,
       occupied_channels: [...occupiedChannels],
       frequencies: extraFrequencies,
-      scan_exclusions: scanExclusions,
+      scan_exclusions: allExclusionRanges(),
       count,
     }),
   }).then(r => r.json());
@@ -942,6 +1036,7 @@ async function assignSuggested(freq, idx) {
 
 loadRegions();
 renderScanExclusionChips();
+renderManualExclusionChips();
 refresh();
 setInterval(refresh, 2000);
 </script>
