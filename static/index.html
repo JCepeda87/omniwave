@@ -68,6 +68,7 @@
     cursor: pointer;
   }
   button.secondary { background: var(--border); color: var(--text); }
+  button.secondary.live { background: var(--ok); color: #05210f; }
   button.danger { background: var(--bad); }
   .devices { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
   .device {
@@ -129,6 +130,8 @@
 <script>
 const devicesEl = document.getElementById('devices');
 const spectrumCache = {};
+const liveScans = {}; // ip -> interval id, only present while live-scanning
+const LIVE_SCAN_INTERVAL_MS = 1500;
 
 function renderSpectrum(spectrum) {
   if (!spectrum || !spectrum.length) return '';
@@ -180,7 +183,7 @@ async function refresh() {
         <div class="metrics">${metricRow}</div>
         ${alerts}
         <div class="device-actions">
-          <button class="secondary" onclick="scanRf('${ip}')">Scan RF</button>
+          <button class="secondary ${liveScans[ip] ? 'live' : ''}" onclick="toggleLiveScan('${ip}')">${liveScans[ip] ? '⏸ Stop Live Scan' : '▶ Start Live Scan'}</button>
           <button class="danger" onclick="removeDevice('${ip}')">Remove</button>
         </div>
         <div class="spectrum" id="spectrum-${CSS.escape(ip)}">${renderSpectrum(spectrumCache[ip])}</div>
@@ -188,7 +191,7 @@ async function refresh() {
   }).join('');
 }
 
-async function scanRf(ip) {
+async function pollScan(ip) {
   const res = await fetch('/scan?ip=' + encodeURIComponent(ip)).then(r => r.json());
   if (!res.spectrum) return;
   spectrumCache[ip] = res.spectrum;
@@ -196,7 +199,22 @@ async function scanRf(ip) {
   if (el) el.innerHTML = renderSpectrum(res.spectrum);
 }
 
+function toggleLiveScan(ip) {
+  if (liveScans[ip]) {
+    clearInterval(liveScans[ip]);
+    delete liveScans[ip];
+  } else {
+    pollScan(ip);
+    liveScans[ip] = setInterval(() => pollScan(ip), LIVE_SCAN_INTERVAL_MS);
+  }
+  refresh();
+}
+
 async function removeDevice(ip) {
+  if (liveScans[ip]) {
+    clearInterval(liveScans[ip]);
+    delete liveScans[ip];
+  }
   await fetch('/devices?ip=' + encodeURIComponent(ip), { method: 'DELETE' });
   refresh();
 }
