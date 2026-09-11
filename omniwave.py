@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from tornado.ioloop import IOLoop
 from tornado.web import Application, RequestHandler
 from providers import ShureProvider, SennheiserProvider
+import spectrum_planner
 
 # --- CONFIGURATION ---
 CENTRAL_HUB_URL = "https://hub.omniwave.io/api/register" # Example Hub URL
@@ -26,6 +27,7 @@ CONFIG_PATH = 'config.json'
 
 Devices = {}
 DeviceNames = {}  # ip -> user-assigned label, e.g. "Lead Vocal"
+DeviceFrequencies = {}  # ip -> assigned carrier frequency in MHz
 DB_PATH = 'omniwave_history.db'
 
 # Columns the metrics table must have. Add a new provider metric here (and it
@@ -89,6 +91,7 @@ class DataHandler(RequestHandler):
             entry = dev.get_json()
             entry['name'] = DeviceNames.get(ip, '')
             entry['brand'] = 'shure' if isinstance(dev, ShureProvider) else 'sennheiser'
+            entry['frequency_mhz'] = DeviceFrequencies.get(ip)
             data[ip] = entry
         self.set_header('Content-Type', 'application/json')
         self.write(json.dumps(data))
@@ -208,6 +211,7 @@ class DeviceHandler(RequestHandler):
             Devices[ip].disconnect()
             del Devices[ip]
             DeviceNames.pop(ip, None)
+            DeviceFrequencies.pop(ip, None)
             remove_device_from_config(ip)
             self.write(json.dumps({'success': True}))
         else:
@@ -226,6 +230,29 @@ class RenameHandler(RequestHandler):
         DeviceNames[ip] = name
         update_device_name_in_config(ip, name)
         self.write(json.dumps({'success': True, 'ip': ip, 'name': name}))
+
+class FrequencyHandler(RequestHandler):
+    """Assign a carrier frequency (MHz) to a device without reconnecting it,
+    so the RF coordination tools can treat it as a frequency already in use."""
+    def post(self):
+        params = json.loads(self.request.body)
+        ip = params.get('ip')
+        freq = params.get('frequency_mhz')
+        if not ip or ip not in Devices:
+            self.set_status(404)
+            return
+        try:
+            freq = round(float(freq), 4) if freq not in (None, '') else None
+        except (TypeError, ValueError):
+            self.set_status(400)
+            self.write(json.dumps({'error': 'frequency_mhz must be a number'}))
+            return
+        if freq is None:
+            DeviceFrequencies.pop(ip, None)
+        else:
+            DeviceFrequencies[ip] = freq
+        update_device_frequency_in_config(ip, freq)
+        self.write(json.dumps({'success': True, 'ip': ip, 'frequency_mhz': freq}))
 
 # Heuristic auto-discovery: probe the local /24 subnet for hosts with a
 # known brand control port open. This is NOT the brands' certified
@@ -365,6 +392,67 @@ class ImportHandler(RequestHandler):
         self.set_status(422)
         self.write(json.dumps({'error': "Couldn't recognize this as a WSM or WWB frequency file."}))
 
+# --- RF coordination (TV-channel + intermodulation planning) --------------
+
+class RegionsHandler(RequestHandler):
+    def get(self):
+        out = {}
+        for key, region in spectrum_planner.REGIONS.items():
+            out[key] = {
+                'name': region['name'],
+                'tv_channel_start': region['tv_channel_start'],
+                'tv_channel_end': region['tv_channel_end'],
+                'tv_channel_width_mhz': region['tv_channel_width_mhz'],
+                'tv_band_start_mhz': region['tv_band_start_mhz'],
+                'wireless_mic_ranges_mhz': region['wireless_mic_ranges_mhz'],
+                'notes': region['notes'],
+            }
+        self.write(json.dumps(out))
+
+def _active_device_frequencies():
+    return [f for f in DeviceFrequencies.values() if f is not None]
+
+class CoordinationCheckHandler(RequestHandler):
+    def post(self):
+        params = json.loads(self.request.body)
+        region = params.get('region')
+        if region not in spectrum_planner.REGIONS:
+            self.set_status(400)
+            self.write(json.dumps({'error': 'unknown region'}))
+            return
+        occupied = [int(c) for c in params.get('occupied_channels', [])]
+        extra = [float(f) for f in params.get('frequencies', [])]
+        im_margin_khz = float(params.get('im_margin_khz', spectrum_planner.IM_MARGIN_KHZ_DEFAULT))
+
+        all_freqs = _active_device_frequencies() + extra
+        conflicts = spectrum_planner.find_im_conflicts(all_freqs, im_margin_khz)
+        ranges = spectrum_planner.usable_ranges(region, occupied)
+        self.write(json.dumps({
+            'usable_ranges_mhz': ranges,
+            'conflicts': conflicts,
+            'frequencies_checked': all_freqs,
+        }))
+
+class CoordinationSuggestHandler(RequestHandler):
+    def post(self):
+        params = json.loads(self.request.body)
+        region = params.get('region')
+        if region not in spectrum_planner.REGIONS:
+            self.set_status(400)
+            self.write(json.dumps({'error': 'unknown region'}))
+            return
+        occupied = [int(c) for c in params.get('occupied_channels', [])]
+        extra = [float(f) for f in params.get('frequencies', [])]
+        count = max(1, min(int(params.get('count', 1)), 50))
+        min_spacing_mhz = float(params.get('min_spacing_khz', spectrum_planner.MIN_SPACING_MHZ_DEFAULT * 1000)) / 1000
+        im_margin_khz = float(params.get('im_margin_khz', spectrum_planner.IM_MARGIN_KHZ_DEFAULT))
+
+        existing = _active_device_frequencies() + extra
+        suggested = spectrum_planner.suggest_frequencies(
+            region, occupied, existing, count,
+            min_spacing_mhz=min_spacing_mhz, im_margin_khz=im_margin_khz)
+        self.write(json.dumps({'suggested_mhz': suggested}))
+
 _last_webhook_sent = {}
 WEBHOOK_COOLDOWN_SECONDS = 60
 
@@ -403,6 +491,13 @@ def update_device_name_in_config(ip, name):
             d['name'] = name
     save_config(devices)
 
+def update_device_frequency_in_config(ip, freq):
+    devices = load_config()
+    for d in devices:
+        if d.get('ip') == ip:
+            d['frequency_mhz'] = freq
+    save_config(devices)
+
 def main():
     init_db()
     register_installation()
@@ -417,8 +512,12 @@ def main():
         (r'/system/update', UpdateHandler),
         (r'/devices', DeviceHandler),
         (r'/devices/rename', RenameHandler),
+        (r'/devices/frequency', FrequencyHandler),
         (r'/discover', DiscoverHandler),
         (r'/import', ImportHandler),
+        (r'/regions', RegionsHandler),
+        (r'/coordination/check', CoordinationCheckHandler),
+        (r'/coordination/suggest', CoordinationSuggestHandler),
         (r'/static/(.*)', StaticHandler),
     ])
     app.listen(9000, address='0.0.0.0')
@@ -430,6 +529,8 @@ def main():
         Devices[ip] = ShureProvider(ip, dtype) if brand == 'shure' else SennheiserProvider(ip, dtype)
         Devices[ip].connect()
         DeviceNames[ip] = dev_cfg.get('name', '')
+        if dev_cfg.get('frequency_mhz') is not None:
+            DeviceFrequencies[ip] = dev_cfg['frequency_mhz']
 
     poll_devices()
     print(f"OmniWave OS v{VERSION} running on 0.0.0.0:9000...")

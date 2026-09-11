@@ -189,6 +189,21 @@
   .freq-table th, .freq-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }
   .freq-table th { color: var(--muted); font-size: 11px; text-transform: uppercase; font-weight: 600; }
   .freq-table tbody tr:hover { background: var(--bg); }
+
+  .coord-row { display: flex; align-items: center; gap: 10px; }
+  .tv-channel-grid { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+  .tv-ch {
+    background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+    border-radius: 5px; padding: 5px 4px; font-size: 11px; min-width: 30px; cursor: pointer;
+  }
+  .tv-ch.occupied { background: var(--bad-dim); border-color: var(--bad); color: var(--bad); font-weight: 700; }
+  .freq-chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .freq-chip {
+    background: var(--accent-dim); color: var(--accent); border-radius: 999px;
+    padding: 4px 10px; font-size: 12px; display: inline-flex; align-items: center; gap: 4px;
+  }
+  .chip-remove { background: none; border: none; color: inherit; padding: 0; font-size: 13px; cursor: pointer; }
+  .device-freq-row { display: flex; align-items: center; gap: 4px; }
 </style>
 </head>
 <body>
@@ -251,6 +266,45 @@
       </form>
       <div class="device-meta" id="importStatus" style="margin-top:8px"></div>
       <div id="importResults"></div>
+    </div>
+  </details>
+
+  <details class="panel" open>
+    <summary>RF Scanner — Frequency Coordination</summary>
+    <div class="details-body">
+      <div class="device-meta" style="margin-bottom:12px">
+        Modeled on how tools like Shure Wireless Workbench and Sennheiser WSM coordinate frequencies: pick a
+        region's TV/regulatory band plan, mark occupied TV channels, and new frequencies are chosen to avoid
+        those ranges plus 3rd-order intermodulation products against everything already active. This is a
+        planning aid based on publicly documented band plans — verify local regulations before a real deployment.
+      </div>
+
+      <div class="coord-row">
+        <label class="device-meta">Region</label>
+        <select id="regionSelect"></select>
+      </div>
+      <div class="device-meta" id="regionNotes" style="margin:8px 0"></div>
+
+      <h2 style="margin-top:16px">TV Channels <span style="font-weight:400">(click to mark occupied)</span></h2>
+      <div class="tv-channel-grid" id="tvChannelGrid"></div>
+
+      <h2 style="margin-top:16px">Active Frequencies</h2>
+      <div class="device-meta" style="margin-bottom:8px">
+        Includes frequencies already assigned to devices below, plus any extra candidates added here (e.g. from an imported plan).
+      </div>
+      <div class="freq-chip-row" id="activeFreqChips"></div>
+      <form id="addFreqForm" class="add-device" style="margin-top:8px">
+        <input type="number" step="0.001" id="addFreqInput" placeholder="e.g. 614.250">
+        <button type="submit" class="secondary">Add Frequency</button>
+      </form>
+
+      <div class="device-actions" style="margin-top:14px">
+        <button onclick="checkCoordination()">Check for Conflicts</button>
+        <input type="number" id="suggestCount" value="1" min="1" max="50" style="width:60px">
+        <button class="secondary" onclick="suggestFrequencies()">Suggest Frequencies</button>
+      </div>
+
+      <div id="coordResults" style="margin-top:14px"></div>
     </div>
   </details>
 
@@ -485,14 +539,31 @@ async function renameDevice(ip, currentName) {
   refresh();
 }
 
+async function assignDeviceFrequency(ip, current) {
+  const input = prompt('Carrier frequency (MHz) — leave blank to clear', current != null ? String(current) : '');
+  if (input === null) return;
+  const trimmed = input.trim();
+  const freq = trimmed === '' ? null : parseFloat(trimmed);
+  if (trimmed !== '' && isNaN(freq)) { alert('Enter a valid number, or leave blank to clear.'); return; }
+  await fetch('/devices/frequency', {
+    method: 'POST',
+    body: JSON.stringify({ ip, frequency_mhz: freq }),
+  });
+  refresh();
+}
+
+let lastData = {};
+
 async function refresh() {
   let data;
   try {
     data = await fetch('/data').then(r => r.json());
   } catch (e) { return; }
+  lastData = data;
 
   renderStats(data);
   renderAlertsFeed(data);
+  renderActiveFreqChips();
 
   const ips = Object.keys(data);
   if (ips.length === 0) {
@@ -521,6 +592,10 @@ async function refresh() {
                 <button class="icon-btn" title="Rename" onclick="renameDevice('${ip}', ${JSON.stringify(label)})">✎</button>
               </div>
               <div class="device-ip">${ip} · ${d.type || ''}</div>
+              <div class="device-freq-row device-meta">
+                ${d.frequency_mhz != null ? d.frequency_mhz.toFixed(3) + ' MHz' : 'No frequency assigned'}
+                <button class="icon-btn" title="Assign frequency" onclick="assignDeviceFrequency('${ip}', ${d.frequency_mhz ?? 'null'})">📻</button>
+              </div>
             </div>
           </div>
           <div class="status-line ${d.status}"><span class="status-dot ${d.status}"></span>${d.status}</div>
@@ -628,6 +703,153 @@ document.getElementById('importForm').addEventListener('submit', async (e) => {
   }
 });
 
+// --- RF Scanner / Frequency Coordination -----------------------------------
+
+let regionsData = {};
+let currentRegion = null;
+const occupiedChannels = new Set();
+const extraFrequencies = [];
+
+async function loadRegions() {
+  regionsData = await fetch('/regions').then(r => r.json());
+  const sel = document.getElementById('regionSelect');
+  sel.innerHTML = Object.entries(regionsData).map(([key, r]) => `<option value="${key}">${r.name}</option>`).join('');
+  currentRegion = Object.keys(regionsData)[0];
+  sel.value = currentRegion;
+  renderRegionDetails();
+}
+
+document.getElementById('regionSelect').addEventListener('change', (e) => {
+  currentRegion = e.target.value;
+  occupiedChannels.clear();
+  renderRegionDetails();
+});
+
+function renderRegionDetails() {
+  const region = regionsData[currentRegion];
+  if (!region) return;
+  document.getElementById('regionNotes').textContent = region.notes;
+  const grid = document.getElementById('tvChannelGrid');
+  let html = '';
+  for (let ch = region.tv_channel_start; ch <= region.tv_channel_end; ch++) {
+    const start = region.tv_band_start_mhz + (ch - region.tv_channel_start) * region.tv_channel_width_mhz;
+    const end = start + region.tv_channel_width_mhz;
+    html += `<button type="button" class="tv-ch ${occupiedChannels.has(ch) ? 'occupied' : ''}" title="${start}-${end} MHz" onclick="toggleChannel(${ch})">${ch}</button>`;
+  }
+  grid.innerHTML = html;
+}
+
+function toggleChannel(ch) {
+  if (occupiedChannels.has(ch)) occupiedChannels.delete(ch); else occupiedChannels.add(ch);
+  renderRegionDetails();
+}
+
+function deviceFrequencyEntries() {
+  return Object.entries(lastData)
+    .filter(([, d]) => d.frequency_mhz != null)
+    .map(([ip, d]) => ({ ip, name: d.name || ip, frequency_mhz: d.frequency_mhz }));
+}
+
+function renderActiveFreqChips() {
+  const el = document.getElementById('activeFreqChips');
+  if (!el) return;
+  const deviceFreqs = deviceFrequencyEntries();
+  const chips = [
+    ...deviceFreqs.map(f => `<span class="freq-chip">${f.name}: ${f.frequency_mhz.toFixed(3)} MHz</span>`),
+    ...extraFrequencies.map((f, i) => `<span class="freq-chip">${f.toFixed(3)} MHz <button class="chip-remove" onclick="removeExtraFreq(${i})">×</button></span>`),
+  ];
+  el.innerHTML = chips.length ? chips.join('') :
+    '<div class="empty" style="padding:8px">No active frequencies yet — assign one to a device or add one below.</div>';
+}
+
+function removeExtraFreq(idx) {
+  extraFrequencies.splice(idx, 1);
+  renderActiveFreqChips();
+}
+
+document.getElementById('addFreqForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const input = document.getElementById('addFreqInput');
+  const val = parseFloat(input.value);
+  if (!isNaN(val)) {
+    extraFrequencies.push(val);
+    input.value = '';
+    renderActiveFreqChips();
+  }
+});
+
+function allActiveFrequencies() {
+  return [...deviceFrequencyEntries().map(f => f.frequency_mhz), ...extraFrequencies];
+}
+
+async function checkCoordination() {
+  const resultsEl = document.getElementById('coordResults');
+  resultsEl.innerHTML = '<div class="device-meta">Checking...</div>';
+  const res = await fetch('/coordination/check', {
+    method: 'POST',
+    body: JSON.stringify({
+      region: currentRegion,
+      occupied_channels: [...occupiedChannels],
+      frequencies: extraFrequencies,
+    }),
+  }).then(r => r.json());
+
+  const conflicts = res.conflicts || [];
+  const conflictsHtml = conflicts.length
+    ? conflicts.map(c => `<div class="alert-row">⚠ ${c.frequency.toFixed(3)} MHz conflicts with the intermodulation product of ${c.generated_by.map(f => f.toFixed(3)).join(' & ')} MHz</div>`).join('')
+    : '<div class="device-meta" style="color:var(--ok)">No intermodulation conflicts detected among active frequencies.</div>';
+  const rangesHtml = (res.usable_ranges_mhz || []).map(([lo, hi]) => `${lo.toFixed(1)}–${hi.toFixed(1)} MHz`).join(', ') || 'none';
+  resultsEl.innerHTML = `<div class="device-meta" style="margin-bottom:8px"><b>Usable spectrum:</b> ${rangesHtml}</div>${conflictsHtml}`;
+}
+
+async function suggestFrequencies() {
+  const resultsEl = document.getElementById('coordResults');
+  const count = parseInt(document.getElementById('suggestCount').value, 10) || 1;
+  resultsEl.innerHTML = '<div class="device-meta">Calculating...</div>';
+  const res = await fetch('/coordination/suggest', {
+    method: 'POST',
+    body: JSON.stringify({
+      region: currentRegion,
+      occupied_channels: [...occupiedChannels],
+      frequencies: extraFrequencies,
+      count,
+    }),
+  }).then(r => r.json());
+
+  const suggested = res.suggested_mhz || [];
+  if (!suggested.length) {
+    resultsEl.innerHTML = '<div class="empty">No clean frequencies found in the usable spectrum.</div>';
+    return;
+  }
+  const deviceOptions = Object.entries(lastData).map(([ip, d]) => `<option value="${ip}">${d.name || ip}</option>`).join('');
+  resultsEl.innerHTML = `
+    <table class="freq-table">
+      <thead><tr><th>#</th><th>Frequency (MHz)</th><th>Assign to device</th></tr></thead>
+      <tbody>${suggested.map((f, i) => `
+        <tr>
+          <td>${i + 1}</td>
+          <td>${f.toFixed(3)}</td>
+          <td>
+            <select id="assignSel-${i}"><option value="">— choose device —</option>${deviceOptions}</select>
+            <button class="secondary" onclick="assignSuggested(${f}, ${i})">Assign</button>
+          </td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+async function assignSuggested(freq, idx) {
+  const sel = document.getElementById('assignSel-' + idx);
+  const ip = sel.value;
+  if (!ip) { alert('Choose a device first.'); return; }
+  await fetch('/devices/frequency', {
+    method: 'POST',
+    body: JSON.stringify({ ip, frequency_mhz: freq }),
+  });
+  refresh();
+}
+
+loadRegions();
 refresh();
 setInterval(refresh, 2000);
 </script>
