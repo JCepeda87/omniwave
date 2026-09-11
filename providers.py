@@ -62,9 +62,12 @@ class ShureProvider(BaseProvider):
         try:
             self.sock.sendall(b'< GET 1 ALL >')
             data = self.sock.recv(1024).decode('utf-8')
-            self.metrics = {'audio': 12, 'rf': 85, 'batt': 15} 
+            self.metrics = {'audio': 12, 'rf': 85, 'batt': 15}
             if self.metrics['batt'] < 20:
-                self.alerts.append(f"Low Battery: {self.metrics['batt']}%")
+                alert = f"Low Battery: {self.metrics['batt']}%"
+                if not self.alerts or self.alerts[-1] != alert:
+                    self.alerts.append(alert)
+                    self.alerts = self.alerts[-20:]
         except Exception: self.status = 'DISCONNECTED'
 
     def scan_rf(self):

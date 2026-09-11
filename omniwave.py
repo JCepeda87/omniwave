@@ -24,6 +24,7 @@ CONFIG_PATH = 'config.json'
 # ---------------------
 
 Devices = {}
+DeviceNames = {}  # ip -> user-assigned label, e.g. "Lead Vocal"
 DB_PATH = 'omniwave_history.db'
 
 # Columns the metrics table must have. Add a new provider metric here (and it
@@ -82,7 +83,12 @@ def send_webhook(message):
 
 class DataHandler(RequestHandler):
     def get(self):
-        data = {ip: dev.get_json() for ip, dev in Devices.items()}
+        data = {}
+        for ip, dev in Devices.items():
+            entry = dev.get_json()
+            entry['name'] = DeviceNames.get(ip, '')
+            entry['brand'] = 'shure' if isinstance(dev, ShureProvider) else 'sennheiser'
+            data[ip] = entry
         self.set_header('Content-Type', 'application/json')
         self.write(json.dumps(data))
 
@@ -182,6 +188,7 @@ class DeviceHandler(RequestHandler):
         ip = params.get('ip')
         brand = params.get('brand', 'shure')
         dtype = params.get('type', 'axtd')
+        name = (params.get('name') or '').strip()
         if not ip:
             self.set_status(400)
             self.write(json.dumps({'error': 'ip is required'}))
@@ -190,7 +197,8 @@ class DeviceHandler(RequestHandler):
         dev = ShureProvider(ip, dtype) if brand == 'shure' else SennheiserProvider(ip, dtype)
         dev.connect()
         Devices[ip] = dev
-        save_device_to_config(ip, brand, dtype)
+        DeviceNames[ip] = name
+        save_device_to_config(ip, brand, dtype, name)
         self.write(json.dumps({'success': True, 'ip': ip, 'status': dev.status}))
 
     def delete(self):
@@ -198,10 +206,25 @@ class DeviceHandler(RequestHandler):
         if ip and ip in Devices:
             Devices[ip].disconnect()
             del Devices[ip]
+            DeviceNames.pop(ip, None)
             remove_device_from_config(ip)
             self.write(json.dumps({'success': True}))
         else:
             self.set_status(404)
+
+class RenameHandler(RequestHandler):
+    """Relabel a device without touching its connection (e.g. "Lead Vocal"
+    instead of a raw IP), unlike DeviceHandler.post which reconnects."""
+    def post(self):
+        params = json.loads(self.request.body)
+        ip = params.get('ip')
+        name = (params.get('name') or '').strip()
+        if not ip or ip not in Devices:
+            self.set_status(404)
+            return
+        DeviceNames[ip] = name
+        update_device_name_in_config(ip, name)
+        self.write(json.dumps({'success': True, 'ip': ip, 'name': name}))
 
 # Heuristic auto-discovery: probe the local /24 subnet for hosts with a
 # known brand control port open. This is NOT the brands' certified
@@ -256,12 +279,17 @@ class DiscoverHandler(RequestHandler):
         candidates = [c for c in candidates if c['ip'] not in Devices]
         self.write(json.dumps({'candidates': candidates}))
 
+_last_webhook_sent = {}
+WEBHOOK_COOLDOWN_SECONDS = 60
+
 def poll_devices():
     for ip, dev in Devices.items():
         dev.poll()
         log_metrics(ip, dev.metrics)
-        if dev.metrics.get('batt', 100) < 15:
-            send_webhook(f"CRITICAL LOW BATTERY: {ip} is at {dev.metrics['batt']}%")
+        batt = dev.metrics.get('batt', 100)
+        if batt < 15 and time.time() - _last_webhook_sent.get(ip, 0) > WEBHOOK_COOLDOWN_SECONDS:
+            send_webhook(f"CRITICAL LOW BATTERY: {ip} is at {batt}%")
+            _last_webhook_sent[ip] = time.time()
     IOLoop.current().call_later(1, poll_devices)
 
 def load_config():
@@ -273,13 +301,20 @@ def save_config(device_list):
     with open(CONFIG_PATH, 'w') as f:
         json.dump({'devices': device_list}, f, indent=2)
 
-def save_device_to_config(ip, brand, dtype):
+def save_device_to_config(ip, brand, dtype, name=''):
     devices = [d for d in load_config() if d.get('ip') != ip]
-    devices.append({'ip': ip, 'brand': brand, 'type': dtype})
+    devices.append({'ip': ip, 'brand': brand, 'type': dtype, 'name': name})
     save_config(devices)
 
 def remove_device_from_config(ip):
     devices = [d for d in load_config() if d.get('ip') != ip]
+    save_config(devices)
+
+def update_device_name_in_config(ip, name):
+    devices = load_config()
+    for d in devices:
+        if d.get('ip') == ip:
+            d['name'] = name
     save_config(devices)
 
 def main():
@@ -295,6 +330,7 @@ def main():
         (r'/stream', StreamHandler),
         (r'/system/update', UpdateHandler),
         (r'/devices', DeviceHandler),
+        (r'/devices/rename', RenameHandler),
         (r'/discover', DiscoverHandler),
         (r'/static/(.*)', StaticHandler),
     ])
@@ -306,6 +342,7 @@ def main():
         dtype = dev_cfg.get('type', 'axtd')
         Devices[ip] = ShureProvider(ip, dtype) if brand == 'shure' else SennheiserProvider(ip, dtype)
         Devices[ip].connect()
+        DeviceNames[ip] = dev_cfg.get('name', '')
 
     poll_devices()
     print(f"OmniWave OS v{VERSION} running on 0.0.0.0:9000...")

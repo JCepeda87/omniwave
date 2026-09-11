@@ -8,25 +8,39 @@
     color-scheme: light dark;
     --bg: #f5f6f8;
     --panel: #ffffff;
+    --panel-raised: #fbfbfc;
     --text: #1a1d21;
     --muted: #6b7280;
     --border: #e3e5e8;
     --accent: #2563eb;
+    --accent-dim: rgba(37,99,235,.12);
     --ok: #16a34a;
+    --ok-dim: rgba(22,163,74,.15);
     --warn: #d97706;
+    --warn-dim: rgba(217,119,6,.15);
     --bad: #dc2626;
+    --bad-dim: rgba(220,38,38,.15);
+    --shure-badge: #7c3aed;
+    --sennheiser-badge: #0891b2;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #15171a;
-      --panel: #1f2226;
+      --bg: #101214;
+      --panel: #191c20;
+      --panel-raised: #202429;
       --text: #f0f1f3;
       --muted: #9aa0a8;
-      --border: #2c3036;
+      --border: #2a2e34;
       --accent: #5b8def;
+      --accent-dim: rgba(91,141,239,.15);
       --ok: #4ade80;
+      --ok-dim: rgba(74,222,128,.15);
       --warn: #fbbf24;
+      --warn-dim: rgba(251,191,36,.15);
       --bad: #f87171;
+      --bad-dim: rgba(248,113,113,.15);
+      --shure-badge: #a78bfa;
+      --sennheiser-badge: #22d3ee;
     }
   }
   * { box-sizing: border-box; }
@@ -36,17 +50,50 @@
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     padding: 24px;
+    max-width: 1200px;
   }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .app-header {
+    display: flex; justify-content: space-between; align-items: flex-end;
+    flex-wrap: wrap; gap: 16px; margin-bottom: 20px;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -.01em; }
+  .subtitle { color: var(--muted); font-size: 13px; }
+  .stats { display: flex; gap: 10px; flex-wrap: wrap; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 8px 16px; text-align: center; min-width: 76px;
+  }
+  .stat .stat-val { font-size: 18px; font-weight: 700; line-height: 1.2; }
+  .stat .stat-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .stat.alerts-nonzero .stat-val { color: var(--bad); }
+
   .panel {
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-radius: 12px;
     padding: 16px;
-    margin-bottom: 20px;
+    margin-bottom: 16px;
   }
-  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .panel h2 { font-size: 13px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  details.panel { padding: 0; }
+  details.panel > summary {
+    list-style: none; cursor: pointer; padding: 14px 16px; font-size: 13px;
+    color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-weight: 600;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  details.panel > summary::-webkit-details-marker { display: none; }
+  details.panel > summary::after { content: '▾'; transition: transform .15s; color: var(--muted); }
+  details.panel[open] > summary::after { transform: rotate(180deg); }
+  details.panel > summary:hover { color: var(--text); }
+  .details-body { padding: 0 16px 16px; border-top: 1px solid var(--border); padding-top: 16px; }
+
+  .alerts-feed { display: flex; flex-direction: column; gap: 6px; }
+  .alert-row {
+    display: flex; gap: 8px; align-items: baseline; font-size: 13px;
+    background: var(--bad-dim); color: var(--bad); border-radius: 8px; padding: 8px 12px;
+  }
+  .alert-row b { color: var(--text); }
+
   form.add-device { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   input, select {
     background: var(--bg);
@@ -57,7 +104,7 @@
     font-size: 13px;
   }
   input[name=ip] { width: 160px; }
-  input[name=type] { width: 100px; }
+  input[name=name] { width: 140px; }
   button {
     background: var(--accent);
     color: white;
@@ -67,79 +114,127 @@
     font-size: 13px;
     cursor: pointer;
   }
+  button:disabled { opacity: .5; cursor: default; }
   button.secondary { background: var(--border); color: var(--text); }
   button.secondary.live { background: var(--ok); color: #05210f; }
   button.danger { background: var(--bad); }
-  .devices { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
-  .device {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 14px;
-  }
-  .device-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-  .device-ip { font-weight: 600; font-size: 14px; }
+  button.icon-btn { background: transparent; color: var(--muted); padding: 2px 6px; font-size: 13px; }
+  button.icon-btn:hover { color: var(--text); }
+
   .device-meta { color: var(--muted); font-size: 12px; }
-  .badge {
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 999px;
-    font-weight: 600;
-  }
-  .badge.CONNECTED { background: rgba(22,163,74,.15); color: var(--ok); }
-  .badge.DISCONNECTED { background: rgba(220,38,38,.15); color: var(--bad); }
-  .metrics { display: flex; gap: 14px; margin: 10px 0; }
-  .metric { flex: 1; text-align: center; }
-  .metric .val { font-size: 18px; font-weight: 700; }
-  .metric.low .val { color: var(--bad); }
-  .metric .label { font-size: 11px; color: var(--muted); text-transform: uppercase; }
-  .alerts { font-size: 12px; color: var(--warn); margin: 6px 0; }
-  .device-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
-  .empty { color: var(--muted); font-size: 13px; padding: 20px; text-align: center; }
   .discovery-controls { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
   .discovery-results { display: flex; flex-direction: column; gap: 8px; }
   .discovery-row {
     display: flex; align-items: center; justify-content: space-between; gap: 10px;
     background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
   }
-  .discovery-row .device-ip { font-weight: 600; font-size: 13px; }
+
+  .devices { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+  .device {
+    background: var(--panel-raised);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+  }
+  .device-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px; gap: 8px; }
+  .device-title { display: flex; gap: 10px; align-items: center; }
+  .brand-badge {
+    width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 11px; color: #fff;
+  }
+  .brand-badge.shure { background: var(--shure-badge); }
+  .brand-badge.sennheiser { background: var(--sennheiser-badge); }
+  .device-name-row { display: flex; align-items: center; gap: 4px; }
+  .device-name { font-weight: 600; font-size: 14px; }
+  .device-ip { color: var(--muted); font-size: 11px; }
+
+  .status-line { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .status-dot.CONNECTED { background: var(--ok); animation: pulse 2s infinite; }
+  .status-dot.DISCONNECTED { background: var(--bad); }
+  .status-line.CONNECTED { color: var(--ok); }
+  .status-line.DISCONNECTED { color: var(--bad); }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 var(--ok-dim); }
+    70% { box-shadow: 0 0 0 6px rgba(0,0,0,0); }
+    100% { box-shadow: 0 0 0 0 rgba(0,0,0,0); }
+  }
+
+  .metrics { display: flex; gap: 12px; margin: 12px 0; }
+  .metric { flex: 1; }
+  .metric-top { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; }
+  .metric-top .metric-val { color: var(--text); font-weight: 700; font-size: 12px; }
+  .bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 3px; background: var(--ok); transition: width .3s; }
+  .metric.low .bar-fill { background: var(--bad); }
+  .metric.low .metric-top .metric-val { color: var(--bad); }
+
+  .alerts { font-size: 12px; color: var(--warn); margin: 6px 0; }
+  .device-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .empty { color: var(--muted); font-size: 13px; padding: 20px; text-align: center; }
+
   .spectrum {
     display: flex; align-items: flex-end; gap: 1px; height: 40px;
     margin-top: 8px; background: var(--bg); border-radius: 6px; padding: 4px;
   }
   .spectrum div { flex: 1; background: var(--accent); border-radius: 1px 1px 0 0; }
+
+  .history-panel { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border); }
+  .history-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+  .history-grid .device-meta { text-align: center; margin-bottom: 2px; }
+  .history-grid svg { display: block; }
 </style>
 </head>
 <body>
-  <h1>OmniWave</h1>
-  <div class="subtitle">Wireless mic & RF system dashboard</div>
-
-  <div class="panel">
-    <h2>Add device</h2>
-    <form class="add-device" id="addForm">
-      <input name="ip" placeholder="192.168.1.50" required>
-      <select name="brand" id="brandSelect">
-        <option value="shure">Shure</option>
-        <option value="sennheiser">Sennheiser</option>
-      </select>
-      <select name="type" id="typeSelect"></select>
-      <input name="typeCustom" id="typeCustom" placeholder="model name" style="display:none">
-      <button type="submit">Add device</button>
-    </form>
+  <div class="app-header">
+    <div>
+      <h1>OmniWave</h1>
+      <div class="subtitle">Wireless mic & RF system dashboard</div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="stat-val" id="statTotal">0</div><div class="stat-label">Devices</div></div>
+      <div class="stat"><div class="stat-val" id="statConnected">0</div><div class="stat-label">Connected</div></div>
+      <div class="stat" id="statAlertsCard"><div class="stat-val" id="statAlerts">0</div><div class="stat-label">Alerts</div></div>
+      <div class="stat"><div class="stat-val" id="statUpdated">—</div><div class="stat-label">Updated</div></div>
+    </div>
   </div>
 
   <div class="panel">
-    <h2>Auto Discovery</h2>
-    <div class="device-meta" style="margin-bottom:10px">
-      Probes your local network for hosts responding on known Shure (2202) / Sennheiser SSC (45) control ports.
-      This is a heuristic port scan, not the brands' certified SLP/mDNS discovery.
+    <h2>Alerts</h2>
+    <div class="alerts-feed" id="alertsFeed">
+      <div class="empty">No active alerts.</div>
     </div>
-    <div class="discovery-controls">
-      <button id="scanBtn" class="secondary" onclick="scanNetwork()">Scan Network</button>
-      <span class="device-meta" id="scanStatus"></span>
-    </div>
-    <div class="discovery-results" id="discoveryResults"></div>
   </div>
+
+  <details class="panel" open>
+    <summary>Manage Devices</summary>
+    <div class="details-body">
+      <h2>Add device</h2>
+      <form class="add-device" id="addForm">
+        <input name="ip" placeholder="192.168.1.50" required>
+        <input name="name" placeholder="Label (e.g. Lead Vocal)">
+        <select name="brand" id="brandSelect">
+          <option value="shure">Shure</option>
+          <option value="sennheiser">Sennheiser</option>
+        </select>
+        <select name="type" id="typeSelect"></select>
+        <input name="typeCustom" id="typeCustom" placeholder="model name" style="display:none">
+        <button type="submit">Add device</button>
+      </form>
+
+      <h2 style="margin-top:20px">Auto Discovery</h2>
+      <div class="device-meta" style="margin-bottom:10px">
+        Probes your local network for hosts responding on known Shure (2202) / Sennheiser SSC (45) control ports.
+        This is a heuristic port scan, not the brands' certified SLP/mDNS discovery.
+      </div>
+      <div class="discovery-controls">
+        <button id="scanBtn" class="secondary" onclick="scanNetwork()">Scan Network</button>
+        <span class="device-meta" id="scanStatus"></span>
+      </div>
+      <div class="discovery-results" id="discoveryResults"></div>
+    </div>
+  </details>
 
   <div class="panel">
     <h2>Devices</h2>
@@ -152,6 +247,8 @@
 const devicesEl = document.getElementById('devices');
 const spectrumCache = {};
 const liveScans = {}; // ip -> interval id, only present while live-scanning
+const historyVisible = {};
+const historyCache = {};
 const LIVE_SCAN_INTERVAL_MS = 1500;
 
 // Curated pool of current wireless mic/IEM systems per brand, for the
@@ -230,7 +327,7 @@ async function scanNetwork() {
       resultsEl.innerHTML = candidates.map((c, i) => `
         <div class="discovery-row">
           <div>
-            <div class="device-ip">${c.ip}</div>
+            <div class="device-name">${c.ip}</div>
             <div class="device-meta">${c.brand} · port ${c.port} open</div>
           </div>
           <select id="discModel-${i}">${modelOptionsHtml(c.brand)}</select>
@@ -264,7 +361,6 @@ function renderSpectrum(spectrum) {
   ).join('');
 }
 
-function badgeClass(status) { return 'badge ' + status; }
 function isLow(key, val) {
   if (val === undefined || val === null) return false;
   if (key === 'batt') return val < 20;
@@ -272,11 +368,113 @@ function isLow(key, val) {
   return false;
 }
 
+function metricBar(key, val) {
+  const pct = (val === undefined || val === null) ? 0 : Math.max(0, Math.min(100, val));
+  const low = isLow(key, val);
+  return `
+    <div class="metric ${low ? 'low' : ''}">
+      <div class="metric-top"><span>${key}</span><span class="metric-val">${val !== undefined && val !== null ? val : '—'}</span></div>
+      <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
+    </div>`;
+}
+
+function sparklinePath(values, w, h) {
+  if (!values.length) return '';
+  const max = Math.max(...values, 1);
+  const min = Math.min(...values, 0);
+  const range = (max - min) || 1;
+  const stepX = values.length > 1 ? w / (values.length - 1) : 0;
+  return values.map((v, i) => {
+    const x = i * stepX;
+    const y = h - ((v - min) / range) * h;
+    return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+}
+
+function historyChart(values, color) {
+  const w = 200, h = 30;
+  if (!values.length) return '<div class="device-meta" style="text-align:center">no data</div>';
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none">
+    <path d="${sparklinePath(values, w, h)}" fill="none" stroke="${color}" stroke-width="2"/>
+  </svg>`;
+}
+
+function renderHistory(rows) {
+  if (!rows || !rows.length) {
+    return '<div class="history-panel"><div class="empty">No history logged yet.</div></div>';
+  }
+  // rows come back newest-first (ORDER BY timestamp DESC); reverse for left-to-right time.
+  const ordered = [...rows].reverse();
+  const col = (idx) => ordered.map(r => r[idx]).filter(v => v !== null && v !== undefined);
+  return `
+    <div class="history-panel">
+      <div class="history-grid">
+        <div><div class="device-meta">BATT</div>${historyChart(col(2), 'var(--ok)')}</div>
+        <div><div class="device-meta">RF</div>${historyChart(col(3), 'var(--accent)')}</div>
+        <div><div class="device-meta">AUDIO</div>${historyChart(col(4), 'var(--warn)')}</div>
+      </div>
+    </div>`;
+}
+
+async function toggleHistory(ip) {
+  if (historyVisible[ip]) {
+    historyVisible[ip] = false;
+    refresh();
+    return;
+  }
+  historyVisible[ip] = true;
+  refresh();
+  try {
+    const rows = await fetch('/analytics?ip=' + encodeURIComponent(ip)).then(r => r.json());
+    historyCache[ip] = rows;
+  } catch (e) { /* leave "no data" state */ }
+  refresh();
+}
+
+function renderAlertsFeed(data) {
+  const el = document.getElementById('alertsFeed');
+  const rows = [];
+  Object.entries(data).forEach(([ip, d]) => {
+    const label = d.name || ip;
+    (d.alerts || []).slice(-5).forEach(text => rows.push({ label, text }));
+  });
+  if (!rows.length) {
+    el.innerHTML = '<div class="empty">No active alerts.</div>';
+    return;
+  }
+  el.innerHTML = rows.slice(-10).reverse().map(r =>
+    `<div class="alert-row">⚠ <b>${r.label}</b> — ${r.text}</div>`).join('');
+}
+
+function renderStats(data) {
+  const ips = Object.keys(data);
+  const connected = ips.filter(ip => data[ip].status === 'CONNECTED').length;
+  const alertCount = ips.reduce((sum, ip) => sum + ((data[ip].alerts || []).length), 0);
+  document.getElementById('statTotal').textContent = ips.length;
+  document.getElementById('statConnected').textContent = connected;
+  document.getElementById('statAlerts').textContent = alertCount;
+  document.getElementById('statAlertsCard').classList.toggle('alerts-nonzero', alertCount > 0);
+  document.getElementById('statUpdated').textContent = new Date().toLocaleTimeString();
+}
+
+async function renameDevice(ip, currentName) {
+  const next = prompt('Device label', currentName || '');
+  if (next === null) return;
+  await fetch('/devices/rename', {
+    method: 'POST',
+    body: JSON.stringify({ ip, name: next.trim() }),
+  });
+  refresh();
+}
+
 async function refresh() {
   let data;
   try {
     data = await fetch('/data').then(r => r.json());
   } catch (e) { return; }
+
+  renderStats(data);
+  renderAlertsFeed(data);
 
   const ips = Object.keys(data);
   if (ips.length === 0) {
@@ -287,29 +485,37 @@ async function refresh() {
   devicesEl.innerHTML = ips.map(ip => {
     const d = data[ip];
     const m = d.metrics || {};
-    const metricRow = ['batt', 'rf', 'audio'].map(k => `
-      <div class="metric ${isLow(k, m[k]) ? 'low' : ''}">
-        <div class="val">${m[k] !== undefined ? m[k] : '—'}</div>
-        <div class="label">${k}</div>
-      </div>`).join('');
+    const label = d.name || ip;
+    const brand = d.brand === 'sennheiser' ? 'sennheiser' : 'shure';
+    const brandInitial = brand === 'sennheiser' ? 'SN' : 'SH';
+    const metricRow = ['batt', 'rf', 'audio'].map(k => metricBar(k, m[k])).join('');
     const alerts = (d.alerts && d.alerts.length)
       ? `<div class="alerts">⚠ ${d.alerts.slice(-3).join(', ')}</div>` : '';
+    const history = historyVisible[ip] ? renderHistory(historyCache[ip]) : '';
     return `
       <div class="device" data-ip="${ip}">
         <div class="device-head">
-          <div>
-            <div class="device-ip">${ip}</div>
-            <div class="device-meta">${d.type || ''}</div>
+          <div class="device-title">
+            <div class="brand-badge ${brand}">${brandInitial}</div>
+            <div>
+              <div class="device-name-row">
+                <span class="device-name">${label}</span>
+                <button class="icon-btn" title="Rename" onclick="renameDevice('${ip}', ${JSON.stringify(label)})">✎</button>
+              </div>
+              <div class="device-ip">${ip} · ${d.type || ''}</div>
+            </div>
           </div>
-          <span class="${badgeClass(d.status)}">${d.status}</span>
+          <div class="status-line ${d.status}"><span class="status-dot ${d.status}"></span>${d.status}</div>
         </div>
         <div class="metrics">${metricRow}</div>
         ${alerts}
         <div class="device-actions">
           <button class="secondary ${liveScans[ip] ? 'live' : ''}" onclick="toggleLiveScan('${ip}')">${liveScans[ip] ? '⏸ Stop Live Scan' : '▶ Start Live Scan'}</button>
+          <button class="secondary" onclick="toggleHistory('${ip}')">${historyVisible[ip] ? 'Hide History' : 'History'}</button>
           <button class="danger" onclick="removeDevice('${ip}')">Remove</button>
         </div>
         <div class="spectrum" id="spectrum-${CSS.escape(ip)}">${renderSpectrum(spectrumCache[ip])}</div>
+        ${history}
       </div>`;
   }).join('');
 }
@@ -350,6 +556,7 @@ document.getElementById('addForm').addEventListener('submit', async (e) => {
     method: 'POST',
     body: JSON.stringify({
       ip: fd.get('ip'),
+      name: fd.get('name'),
       brand: fd.get('brand'),
       type: type,
     }),
