@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>OmniWave</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --text: #1a1d21;
+    --muted: #6b7280;
+    --border: #e3e5e8;
+    --accent: #2563eb;
+    --ok: #16a34a;
+    --warn: #d97706;
+    --bad: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15171a;
+      --panel: #1f2226;
+      --text: #f0f1f3;
+      --muted: #9aa0a8;
+      --border: #2c3036;
+      --accent: #5b8def;
+      --ok: #4ade80;
+      --warn: #fbbf24;
+      --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 20px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  form.add-device { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  input, select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  input[name=ip] { width: 160px; }
+  input[name=type] { width: 100px; }
+  button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button.secondary { background: var(--border); color: var(--text); }
+  button.danger { background: var(--bad); }
+  .devices { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
+  .device {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+  }
+  .device-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .device-ip { font-weight: 600; font-size: 14px; }
+  .device-meta { color: var(--muted); font-size: 12px; }
+  .badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-weight: 600;
+  }
+  .badge.CONNECTED { background: rgba(22,163,74,.15); color: var(--ok); }
+  .badge.DISCONNECTED { background: rgba(220,38,38,.15); color: var(--bad); }
+  .metrics { display: flex; gap: 14px; margin: 10px 0; }
+  .metric { flex: 1; text-align: center; }
+  .metric .val { font-size: 18px; font-weight: 700; }
+  .metric.low .val { color: var(--bad); }
+  .metric .label { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+  .alerts { font-size: 12px; color: var(--warn); margin: 6px 0; }
+  .device-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .empty { color: var(--muted); font-size: 13px; padding: 20px; text-align: center; }
+  .spectrum {
+    display: flex; align-items: flex-end; gap: 1px; height: 40px;
+    margin-top: 8px; background: var(--bg); border-radius: 6px; padding: 4px;
+  }
+  .spectrum div { flex: 1; background: var(--accent); border-radius: 1px 1px 0 0; }
+</style>
+</head>
+<body>
+  <h1>OmniWave</h1>
+  <div class="subtitle">Wireless mic & RF system dashboard</div>
+
+  <div class="panel">
+    <h2>Add device</h2>
+    <form class="add-device" id="addForm">
+      <input name="ip" placeholder="192.168.1.50" required>
+      <select name="brand">
+        <option value="shure">Shure</option>
+        <option value="sennheiser">Sennheiser</option>
+      </select>
+      <input name="type" placeholder="type (e.g. axtd)" value="axtd">
+      <button type="submit">Add device</button>
+    </form>
+  </div>
+
+  <div class="panel">
+    <h2>Devices</h2>
+    <div class="devices" id="devices">
+      <div class="empty">No devices yet — add one above.</div>
+    </div>
+  </div>
+
+<script>
+const devicesEl = document.getElementById('devices');
+const spectrumCache = {};
+
+function renderSpectrum(spectrum) {
+  if (!spectrum || !spectrum.length) return '';
+  const max = Math.max(...spectrum.map(p => p[1]), 1);
+  return spectrum.map(p =>
+    `<div style="height:${Math.max(4, (p[1] / max) * 36)}px" title="${p[0]} MHz: ${p[1]}"></div>`
+  ).join('');
+}
+
+function badgeClass(status) { return 'badge ' + status; }
+function isLow(key, val) {
+  if (val === undefined || val === null) return false;
+  if (key === 'batt') return val < 20;
+  if (key === 'rf') return val < 30;
+  return false;
+}
+
+async function refresh() {
+  let data;
+  try {
+    data = await fetch('/data').then(r => r.json());
+  } catch (e) { return; }
+
+  const ips = Object.keys(data);
+  if (ips.length === 0) {
+    devicesEl.innerHTML = '<div class="empty">No devices yet — add one above.</div>';
+    return;
+  }
+
+  devicesEl.innerHTML = ips.map(ip => {
+    const d = data[ip];
+    const m = d.metrics || {};
+    const metricRow = ['batt', 'rf', 'audio'].map(k => `
+      <div class="metric ${isLow(k, m[k]) ? 'low' : ''}">
+        <div class="val">${m[k] !== undefined ? m[k] : '—'}</div>
+        <div class="label">${k}</div>
+      </div>`).join('');
+    const alerts = (d.alerts && d.alerts.length)
+      ? `<div class="alerts">⚠ ${d.alerts.slice(-3).join(', ')}</div>` : '';
+    return `
+      <div class="device" data-ip="${ip}">
+        <div class="device-head">
+          <div>
+            <div class="device-ip">${ip}</div>
+            <div class="device-meta">${d.type || ''}</div>
+          </div>
+          <span class="${badgeClass(d.status)}">${d.status}</span>
+        </div>
+        <div class="metrics">${metricRow}</div>
+        ${alerts}
+        <div class="device-actions">
+          <button class="secondary" onclick="scanRf('${ip}')">Scan RF</button>
+          <button class="danger" onclick="removeDevice('${ip}')">Remove</button>
+        </div>
+        <div class="spectrum" id="spectrum-${CSS.escape(ip)}">${renderSpectrum(spectrumCache[ip])}</div>
+      </div>`;
+  }).join('');
+}
+
+async function scanRf(ip) {
+  const res = await fetch('/scan?ip=' + encodeURIComponent(ip)).then(r => r.json());
+  if (!res.spectrum) return;
+  spectrumCache[ip] = res.spectrum;
+  const el = document.getElementById('spectrum-' + CSS.escape(ip));
+  if (el) el.innerHTML = renderSpectrum(res.spectrum);
+}
+
+async function removeDevice(ip) {
+  await fetch('/devices?ip=' + encodeURIComponent(ip), { method: 'DELETE' });
+  refresh();
+}
+
+document.getElementById('addForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  await fetch('/devices', {
+    method: 'POST',
+    body: JSON.stringify({
+      ip: fd.get('ip'),
+      brand: fd.get('brand'),
+      type: fd.get('type'),
+    }),
+  });
+  e.target.reset();
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -154,6 +154,11 @@ class StreamHandler(RequestHandler):
         self.set_header('Content-Type', 'audio/mpeg')
         self.write(f"Audio stream proxy for {ip}")
 
+class IndexHandler(RequestHandler):
+    def get(self):
+        with open(os.path.join(os.path.abspath('.'), 'static', 'index.html'), 'rb') as f:
+            self.write(f.read())
+
 class StaticHandler(RequestHandler):
     def get(self):
         path = self.get_argument('path')
@@ -226,6 +231,7 @@ def main():
     register_installation()
     
     app = Application([
+        (r'/', IndexHandler),
         (r'/data', DataHandler),
         (r'/analytics', AnalyticsHandler),
         (r'/command', CommandHandler),

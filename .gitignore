@@ -7,3 +7,4 @@ venv/
 # Runtime state, not source
 config.json
 omniwave_history.db
+.claude/scheduled_tasks.lock
