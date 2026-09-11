@@ -422,11 +422,12 @@ class CoordinationCheckHandler(RequestHandler):
             return
         occupied = [int(c) for c in params.get('occupied_channels', [])]
         extra = [float(f) for f in params.get('frequencies', [])]
+        scan_exclusions = [tuple(r) for r in params.get('scan_exclusions', [])]
         im_margin_khz = float(params.get('im_margin_khz', spectrum_planner.IM_MARGIN_KHZ_DEFAULT))
 
         all_freqs = _active_device_frequencies() + extra
         conflicts = spectrum_planner.find_im_conflicts(all_freqs, im_margin_khz)
-        ranges = spectrum_planner.usable_ranges(region, occupied)
+        ranges = spectrum_planner.usable_ranges(region, occupied, scan_exclusions)
         self.write(json.dumps({
             'usable_ranges_mhz': ranges,
             'conflicts': conflicts,
@@ -443,6 +444,7 @@ class CoordinationSuggestHandler(RequestHandler):
             return
         occupied = [int(c) for c in params.get('occupied_channels', [])]
         extra = [float(f) for f in params.get('frequencies', [])]
+        scan_exclusions = [tuple(r) for r in params.get('scan_exclusions', [])]
         count = max(1, min(int(params.get('count', 1)), 50))
         min_spacing_mhz = float(params.get('min_spacing_khz', spectrum_planner.MIN_SPACING_MHZ_DEFAULT * 1000)) / 1000
         im_margin_khz = float(params.get('im_margin_khz', spectrum_planner.IM_MARGIN_KHZ_DEFAULT))
@@ -450,8 +452,25 @@ class CoordinationSuggestHandler(RequestHandler):
         existing = _active_device_frequencies() + extra
         suggested = spectrum_planner.suggest_frequencies(
             region, occupied, existing, count,
-            min_spacing_mhz=min_spacing_mhz, im_margin_khz=im_margin_khz)
+            min_spacing_mhz=min_spacing_mhz, im_margin_khz=im_margin_khz,
+            extra_excluded_ranges=scan_exclusions)
         self.write(json.dumps({'suggested_mhz': suggested}))
+
+class ScanExclusionsHandler(RequestHandler):
+    """Turns raw scan data (from a device's own /scan or an imported WSM
+    scan) into excluded frequency ranges, same "exclusion generation" +
+    "threshold calculation" step WWB runs on its own scan data."""
+    def post(self):
+        params = json.loads(self.request.body)
+        spectrum = params.get('spectrum', [])
+        try:
+            threshold = float(params.get('threshold'))
+        except (TypeError, ValueError):
+            self.set_status(400)
+            self.write(json.dumps({'error': 'threshold must be a number'}))
+            return
+        ranges = spectrum_planner.exclusions_from_scan(spectrum, threshold)
+        self.write(json.dumps({'excluded_ranges': ranges}))
 
 _last_webhook_sent = {}
 WEBHOOK_COOLDOWN_SECONDS = 60
@@ -518,6 +537,7 @@ def main():
         (r'/regions', RegionsHandler),
         (r'/coordination/check', CoordinationCheckHandler),
         (r'/coordination/suggest', CoordinationSuggestHandler),
+        (r'/coordination/scan-exclusions', ScanExclusionsHandler),
         (r'/static/(.*)', StaticHandler),
     ])
     app.listen(9000, address='0.0.0.0')

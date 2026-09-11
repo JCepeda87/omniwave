@@ -288,6 +288,20 @@
       <h2 style="margin-top:16px">TV Channels <span style="font-weight:400">(click to mark occupied)</span></h2>
       <div class="tv-channel-grid" id="tvChannelGrid"></div>
 
+      <h2 style="margin-top:16px">Scan-Based Exclusions</h2>
+      <div class="device-meta" style="margin-bottom:8px">
+        Mirrors how WWB itself builds exclusions: sweep the spectrum (muting your own transmitters first so
+        you're reading the ambient environment, not your own gear), then anything crossing the threshold
+        below becomes an excluded range, same as the TV channels above.
+      </div>
+      <div class="coord-row" style="flex-wrap:wrap; gap:10px">
+        <select id="scanDeviceSelect"></select>
+        <button class="secondary" onclick="muteAllAndScan()">Mute All &amp; Scan Selected</button>
+        <button class="secondary" id="useImportedScanBtn" onclick="useImportedScan()" style="display:none">Use Last Imported Scan</button>
+      </div>
+      <div id="scanThresholdControls"></div>
+      <div class="freq-chip-row" id="scanExclusionChips" style="margin-top:8px"></div>
+
       <h2 style="margin-top:16px">Active Frequencies</h2>
       <div class="device-meta" style="margin-bottom:8px">
         Includes frequencies already assigned to devices below, plus any extra candidates added here (e.g. from an imported plan).
@@ -563,6 +577,7 @@ async function refresh() {
 
   renderStats(data);
   renderAlertsFeed(data);
+  populateScanDeviceSelect();
   renderActiveFreqChips();
 
   const ips = Object.keys(data);
@@ -663,6 +678,9 @@ function renderImportResults(data) {
   const el = document.getElementById('importResults');
   if (data.format === 'wsm_scan') {
     el.innerHTML = `<div class="spectrum" style="height:60px">${renderSpectrum(data.spectrum)}</div>`;
+    lastImportedScanSpectrum = data.spectrum;
+    const btn = document.getElementById('useImportedScanBtn');
+    if (btn) btn.style.display = '';
     return;
   }
   const rows = data.frequencies || [];
@@ -709,6 +727,9 @@ let regionsData = {};
 let currentRegion = null;
 const occupiedChannels = new Set();
 const extraFrequencies = [];
+let lastScanSpectrum = null;
+let lastImportedScanSpectrum = null;
+const scanExclusions = [];
 
 async function loadRegions() {
   regionsData = await fetch('/regions').then(r => r.json());
@@ -782,6 +803,74 @@ function allActiveFrequencies() {
   return [...deviceFrequencyEntries().map(f => f.frequency_mhz), ...extraFrequencies];
 }
 
+function populateScanDeviceSelect() {
+  const sel = document.getElementById('scanDeviceSelect');
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = Object.entries(lastData).map(([ip, d]) => `<option value="${ip}">${d.name || ip}</option>`).join('');
+  if (prev) sel.value = prev;
+}
+
+async function muteAllAndScan() {
+  const sel = document.getElementById('scanDeviceSelect');
+  const ip = sel && sel.value;
+  if (!ip) { alert('Add a device first.'); return; }
+  // Documented best practice: mute your own transmitters before reading
+  // the ambient spectrum, so your own gear doesn't show up as "occupied".
+  await Promise.all(Object.keys(lastData).map(devIp =>
+    fetch('/command', { method: 'POST', body: JSON.stringify({ ip: devIp, command: 'MUTE', value: 1, channel: 1 }) })
+  ));
+  const res = await fetch('/scan?ip=' + encodeURIComponent(ip)).then(r => r.json());
+  setScanSpectrum(res.spectrum || []);
+}
+
+function useImportedScan() {
+  if (lastImportedScanSpectrum) setScanSpectrum(lastImportedScanSpectrum);
+}
+
+function setScanSpectrum(spectrum) {
+  lastScanSpectrum = spectrum;
+  const controls = document.getElementById('scanThresholdControls');
+  if (!spectrum.length) {
+    controls.innerHTML = '<div class="empty">No scan data.</div>';
+    return;
+  }
+  const levels = spectrum.map(p => p[1]);
+  const min = Math.min(...levels), max = Math.max(...levels);
+  const mid = Math.round(((min + max) / 2) * 10) / 10;
+  controls.innerHTML = `
+    <div class="device-meta">Scan levels range ${min} to ${max}. Anything at or above the threshold is treated as occupied.</div>
+    <div class="coord-row" style="margin-top:6px">
+      <input type="number" id="thresholdInput" value="${mid}" step="0.1">
+      <button class="secondary" onclick="generateExclusions()">Generate Exclusions</button>
+    </div>
+    <div class="spectrum" style="margin-top:8px">${renderSpectrum(spectrum)}</div>`;
+}
+
+async function generateExclusions() {
+  if (!lastScanSpectrum) return;
+  const threshold = parseFloat(document.getElementById('thresholdInput').value);
+  const res = await fetch('/coordination/scan-exclusions', {
+    method: 'POST',
+    body: JSON.stringify({ spectrum: lastScanSpectrum, threshold }),
+  }).then(r => r.json());
+  scanExclusions.length = 0;
+  scanExclusions.push(...(res.excluded_ranges || []));
+  renderScanExclusionChips();
+}
+
+function renderScanExclusionChips() {
+  const el = document.getElementById('scanExclusionChips');
+  el.innerHTML = scanExclusions.length
+    ? scanExclusions.map((r, i) => `<span class="freq-chip">${r[0].toFixed(3)}–${r[1].toFixed(3)} MHz <button class="chip-remove" onclick="removeScanExclusion(${i})">×</button></span>`).join('')
+    : '<div class="empty" style="padding:8px">No scan-based exclusions yet.</div>';
+}
+
+function removeScanExclusion(idx) {
+  scanExclusions.splice(idx, 1);
+  renderScanExclusionChips();
+}
+
 async function checkCoordination() {
   const resultsEl = document.getElementById('coordResults');
   resultsEl.innerHTML = '<div class="device-meta">Checking...</div>';
@@ -791,6 +880,7 @@ async function checkCoordination() {
       region: currentRegion,
       occupied_channels: [...occupiedChannels],
       frequencies: extraFrequencies,
+      scan_exclusions: scanExclusions,
     }),
   }).then(r => r.json());
 
@@ -812,6 +902,7 @@ async function suggestFrequencies() {
       region: currentRegion,
       occupied_channels: [...occupiedChannels],
       frequencies: extraFrequencies,
+      scan_exclusions: scanExclusions,
       count,
     }),
   }).then(r => r.json());
@@ -850,6 +941,7 @@ async function assignSuggested(freq, idx) {
 }
 
 loadRegions();
+renderScanExclusionChips();
 refresh();
 setInterval(refresh, 2000);
 </script>

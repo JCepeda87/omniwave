@@ -56,10 +56,33 @@ def tv_channel_frequency(region_key, channel_num):
     return (round(start, 3), round(start + width, 3))
 
 
-def usable_ranges(region_key, occupied_tv_channels):
-    """Legal wireless-mic ranges for the region, minus the given occupied TV channels."""
+def exclusions_from_scan(spectrum_mhz_level, threshold, guard_mhz=0.1):
+    """The "exclusion generation" / "threshold calculation" step WWB does
+    with its own scan data: group contiguous scan points at/above
+    `threshold` into excluded [lo, hi] ranges, padded by a small guard band."""
+    points = sorted(spectrum_mhz_level, key=lambda p: p[0])
+    ranges = []
+    current = None
+    for freq, level in points:
+        if level >= threshold:
+            if current is None:
+                current = [freq, freq]
+            else:
+                current[1] = freq
+        elif current is not None:
+            ranges.append((round(current[0] - guard_mhz, 4), round(current[1] + guard_mhz, 4)))
+            current = None
+    if current is not None:
+        ranges.append((round(current[0] - guard_mhz, 4), round(current[1] + guard_mhz, 4)))
+    return ranges
+
+
+def usable_ranges(region_key, occupied_tv_channels, extra_excluded_ranges=None):
+    """Legal wireless-mic ranges for the region, minus the given occupied TV
+    channels and any extra excluded ranges (e.g. from a spectrum scan)."""
     region = REGIONS[region_key]
     excluded = [tv_channel_frequency(region_key, ch) for ch in occupied_tv_channels]
+    excluded += list(extra_excluded_ranges or [])
     segments = list(region['wireless_mic_ranges_mhz'])
     for (elo, ehi) in excluded:
         next_segments = []
@@ -131,11 +154,12 @@ def _conflicts_with_set(candidate, chosen, min_spacing_mhz, margin_mhz):
 def suggest_frequencies(region_key, occupied_tv_channels, existing_mhz, count,
                          min_spacing_mhz=MIN_SPACING_MHZ_DEFAULT,
                          im_margin_khz=IM_MARGIN_KHZ_DEFAULT,
-                         step_khz=SUGGEST_STEP_KHZ_DEFAULT):
+                         step_khz=SUGGEST_STEP_KHZ_DEFAULT,
+                         extra_excluded_ranges=None):
     """Greedily pick `count` new frequencies inside the region's usable
     spectrum that keep min_spacing_mhz from, and avoid 3rd-order IM
     conflicts with, everything already in `existing_mhz` and each other."""
-    ranges = usable_ranges(region_key, occupied_tv_channels)
+    ranges = usable_ranges(region_key, occupied_tv_channels, extra_excluded_ranges)
     step = step_khz / 1000
     margin_mhz = im_margin_khz / 1000
     chosen = list(existing_mhz)
