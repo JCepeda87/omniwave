@@ -96,7 +96,10 @@ class DataHandler(RequestHandler):
             entry = dev.get_json()
             entry['name'] = DeviceNames.get(ip, '')
             entry['brand'] = 'shure' if isinstance(dev, (ShureProvider, UHFRProvider)) else 'sennheiser'
-            entry['frequency_mhz'] = DeviceFrequencies.get(ip)
+            # Prefer the live, hardware-reported frequency (real Shure gear
+            # reports this every poll) over the locally-assigned one, so the
+            # UI reflects what's actually on air rather than stale bookkeeping.
+            entry['frequency_mhz'] = dev.metrics.get('frequency_mhz', DeviceFrequencies.get(ip))
             data[ip] = entry
         self.set_header('Content-Type', 'application/json')
         self.write(json.dumps(data))
@@ -241,8 +244,9 @@ class RenameHandler(RequestHandler):
         self.write(json.dumps({'success': True, 'ip': ip, 'name': name}))
 
 class FrequencyHandler(RequestHandler):
-    """Assign a carrier frequency (MHz) to a device without reconnecting it,
-    so the RF coordination tools can treat it as a frequency already in use."""
+    """Assign a carrier frequency (MHz) to a device and, for a connected
+    device, actually push it to the hardware (SET FREQUENCY) -- this is the
+    real "Assign & Deploy" step, not just local bookkeeping."""
     def post(self):
         params = json.loads(self.request.body)
         ip = params.get('ip')
@@ -261,7 +265,11 @@ class FrequencyHandler(RequestHandler):
         else:
             DeviceFrequencies[ip] = freq
         update_device_frequency_in_config(ip, freq)
-        self.write(json.dumps({'success': True, 'ip': ip, 'frequency_mhz': freq}))
+
+        deployed = False
+        if freq is not None and Devices[ip].status == 'CONNECTED':
+            deployed = Devices[ip].send_command('FREQUENCY', freq)
+        self.write(json.dumps({'success': True, 'ip': ip, 'frequency_mhz': freq, 'deployed': deployed}))
 
 # Heuristic auto-discovery: probe the local /24 subnet for hosts with a
 # known brand control port open. This is NOT the brands' certified
@@ -419,7 +427,15 @@ class RegionsHandler(RequestHandler):
         self.write(json.dumps(out))
 
 def _active_device_frequencies():
-    return [f for f in DeviceFrequencies.values() if f is not None]
+    """Every device's best-known frequency: the live hardware reading when
+    available (so coordination always accounts for what's actually on air),
+    falling back to the locally-assigned one for devices that don't report it."""
+    freqs = []
+    for ip, dev in Devices.items():
+        freq = dev.metrics.get('frequency_mhz', DeviceFrequencies.get(ip))
+        if freq is not None:
+            freqs.append(freq)
+    return freqs
 
 class CoordinationCheckHandler(RequestHandler):
     def post(self):

@@ -322,7 +322,9 @@
 
       <h2 style="margin-top:16px">Active Frequencies</h2>
       <div class="device-meta" style="margin-bottom:8px">
-        Includes frequencies already assigned to devices below, plus any extra candidates added here (e.g. from an imported plan).
+        Auto-includes each connected device's real, live-reported frequency (falling back to a manually assigned
+        one for devices that don't report it), plus any extra candidates added here. Assigning a new frequency
+        below pushes it live to connected hardware, not just this app's bookkeeping.
       </div>
       <div class="freq-chip-row" id="activeFreqChips"></div>
       <form id="addFreqForm" class="add-device" style="margin-top:8px">
@@ -584,10 +586,13 @@ async function assignDeviceFrequency(ip, current) {
   const trimmed = input.trim();
   const freq = trimmed === '' ? null : parseFloat(trimmed);
   if (trimmed !== '' && isNaN(freq)) { alert('Enter a valid number, or leave blank to clear.'); return; }
-  await fetch('/devices/frequency', {
+  const res = await fetch('/devices/frequency', {
     method: 'POST',
     body: JSON.stringify({ ip, frequency_mhz: freq }),
-  });
+  }).then(r => r.json());
+  if (freq !== null && !res.deployed) {
+    alert('Saved, but not pushed to hardware (device not connected) — it will only take effect once reconnected, or shows as a planning value.');
+  }
   refresh();
 }
 
@@ -965,10 +970,11 @@ async function calculateAllAndDeploy() {
     resultsEl.innerHTML = `<div class="empty">Only found ${suggested.length} clean frequencies for ${unlockedIps.length} device(s) — narrow your exclusions or reduce device count.</div>`;
     return;
   }
-  await Promise.all(unlockedIps.map((ip, i) =>
-    fetch('/devices/frequency', { method: 'POST', body: JSON.stringify({ ip, frequency_mhz: suggested[i] }) })
+  const assignResults = await Promise.all(unlockedIps.map((ip, i) =>
+    fetch('/devices/frequency', { method: 'POST', body: JSON.stringify({ ip, frequency_mhz: suggested[i] }) }).then(r => r.json())
   ));
-  resultsEl.innerHTML = `<div class="device-meta" style="color:var(--ok)">Deployed ${suggested.length} clean frequencies to ${unlockedIps.length} unlocked device(s).</div>`;
+  const deployedCount = assignResults.filter(r => r.deployed).length;
+  resultsEl.innerHTML = `<div class="device-meta" style="color:var(--ok)">Assigned ${suggested.length} clean frequencies to ${unlockedIps.length} device(s) — ${deployedCount} pushed live to connected hardware, ${unlockedIps.length - deployedCount} saved locally only.</div>`;
   refresh();
 }
 
@@ -1034,10 +1040,19 @@ async function assignSuggested(freq, idx) {
   const sel = document.getElementById('assignSel-' + idx);
   const ip = sel.value;
   if (!ip) { alert('Choose a device first.'); return; }
-  await fetch('/devices/frequency', {
+  const res = await fetch('/devices/frequency', {
     method: 'POST',
     body: JSON.stringify({ ip, frequency_mhz: freq }),
-  });
+  }).then(r => r.json());
+  const status = document.getElementById('coordResults');
+  const note = document.createElement('div');
+  note.className = 'device-meta';
+  note.style.marginTop = '8px';
+  note.style.color = res.deployed ? 'var(--ok)' : 'var(--muted)';
+  note.textContent = res.deployed
+    ? `${freq.toFixed(3)} MHz pushed live to ${lastData[ip]?.name || ip}.`
+    : `${freq.toFixed(3)} MHz saved for ${lastData[ip]?.name || ip} (not connected, so not pushed to hardware).`;
+  status.appendChild(note);
   refresh();
 }
 
