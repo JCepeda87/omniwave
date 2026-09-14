@@ -14,7 +14,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from tornado.ioloop import IOLoop
 from tornado.web import Application, RequestHandler
-from providers import ShureProvider, SennheiserProvider
+from providers import ShureProvider, SennheiserProvider, UHFRProvider
 import spectrum_planner
 
 # --- CONFIGURATION ---
@@ -29,6 +29,11 @@ Devices = {}
 DeviceNames = {}  # ip -> user-assigned label, e.g. "Lead Vocal"
 DeviceFrequencies = {}  # ip -> assigned carrier frequency in MHz
 DB_PATH = 'omniwave_history.db'
+
+def make_provider(ip, brand, dtype, channel=1):
+    if brand == 'shure':
+        return UHFRProvider(ip, dtype, channel=channel) if dtype == 'uhf-r' else ShureProvider(ip, dtype, channel=channel)
+    return SennheiserProvider(ip, dtype)
 
 # Columns the metrics table must have. Add a new provider metric here (and it
 # will be picked up automatically on the next restart, including the restart
@@ -90,7 +95,7 @@ class DataHandler(RequestHandler):
         for ip, dev in Devices.items():
             entry = dev.get_json()
             entry['name'] = DeviceNames.get(ip, '')
-            entry['brand'] = 'shure' if isinstance(dev, ShureProvider) else 'sennheiser'
+            entry['brand'] = 'shure' if isinstance(dev, (ShureProvider, UHFRProvider)) else 'sennheiser'
             entry['frequency_mhz'] = DeviceFrequencies.get(ip)
             data[ip] = entry
         self.set_header('Content-Type', 'application/json')
@@ -193,16 +198,20 @@ class DeviceHandler(RequestHandler):
         brand = params.get('brand', 'shure')
         dtype = params.get('type', 'axtd')
         name = (params.get('name') or '').strip()
+        try:
+            channel = int(params.get('channel', 1) or 1)
+        except (TypeError, ValueError):
+            channel = 1
         if not ip:
             self.set_status(400)
             self.write(json.dumps({'error': 'ip is required'}))
             return
 
-        dev = ShureProvider(ip, dtype) if brand == 'shure' else SennheiserProvider(ip, dtype)
+        dev = make_provider(ip, brand, dtype, channel)
         dev.connect()
         Devices[ip] = dev
         DeviceNames[ip] = name
-        save_device_to_config(ip, brand, dtype, name)
+        save_device_to_config(ip, brand, dtype, name, channel)
         self.write(json.dumps({'success': True, 'ip': ip, 'status': dev.status}))
 
     def delete(self):
@@ -494,9 +503,9 @@ def save_config(device_list):
     with open(CONFIG_PATH, 'w') as f:
         json.dump({'devices': device_list}, f, indent=2)
 
-def save_device_to_config(ip, brand, dtype, name=''):
+def save_device_to_config(ip, brand, dtype, name='', channel=1):
     devices = [d for d in load_config() if d.get('ip') != ip]
-    devices.append({'ip': ip, 'brand': brand, 'type': dtype, 'name': name})
+    devices.append({'ip': ip, 'brand': brand, 'type': dtype, 'name': name, 'channel': channel})
     save_config(devices)
 
 def remove_device_from_config(ip):
@@ -546,7 +555,8 @@ def main():
         ip = dev_cfg['ip']
         brand = dev_cfg.get('brand', 'shure')
         dtype = dev_cfg.get('type', 'axtd')
-        Devices[ip] = ShureProvider(ip, dtype) if brand == 'shure' else SennheiserProvider(ip, dtype)
+        channel = dev_cfg.get('channel', 1)
+        Devices[ip] = make_provider(ip, brand, dtype, channel)
         Devices[ip].connect()
         DeviceNames[ip] = dev_cfg.get('name', '')
         if dev_cfg.get('frequency_mhz') is not None:

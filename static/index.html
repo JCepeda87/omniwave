@@ -240,8 +240,14 @@
         </select>
         <select name="type" id="typeSelect"></select>
         <input name="typeCustom" id="typeCustom" placeholder="model name" style="display:none">
+        <input type="number" name="channel" min="1" max="8" value="1" title="Channel (for multi-channel receivers, e.g. 1 or 2 on a dual)" style="width:56px">
         <button type="submit">Add device</button>
       </form>
+      <div class="device-meta" style="margin-top:6px">
+        Channel picks which channel to monitor on a multi-channel receiver (e.g. a dual UR4D or quad ULXD4Q).
+        Each IP is currently tracked as one device, so re-adding the same IP with a different channel replaces
+        this entry rather than adding a second one alongside it.
+      </div>
 
       <h2 style="margin-top:20px">Auto Discovery</h2>
       <div class="device-meta" style="margin-bottom:10px">
@@ -625,7 +631,7 @@ async function refresh() {
                 <span class="device-name">${label}</span>
                 <button class="icon-btn" title="Rename" onclick="renameDevice('${ip}', ${JSON.stringify(label)})">✎</button>
               </div>
-              <div class="device-ip">${ip} · ${d.type || ''}</div>
+              <div class="device-ip">${ip} · ${d.type || ''}${d.channel ? ' · ch ' + d.channel : ''}</div>
               <div class="device-freq-row device-meta">
                 ${d.frequency_mhz != null ? d.frequency_mhz.toFixed(3) + ' MHz' : 'No frequency assigned'}
                 <button class="icon-btn" title="Assign frequency" onclick="assignDeviceFrequency('${ip}', ${d.frequency_mhz ?? 'null'})">📻</button>
@@ -687,6 +693,7 @@ document.getElementById('addForm').addEventListener('submit', async (e) => {
       name: fd.get('name'),
       brand: fd.get('brand'),
       type: type,
+      channel: fd.get('channel'),
     }),
   });
   e.target.reset();

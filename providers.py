@@ -48,6 +48,7 @@ class BaseProvider(ABC):
             'spectrum': self.spectrum_data,
             'alerts': self.alerts,
             'model': getattr(self, 'model', None),
+            'channel': getattr(self, 'channel', 1),
         }
 
 class ShureProvider(BaseProvider):
@@ -186,6 +187,157 @@ class ShureProvider(BaseProvider):
                 self._send(f'< SET {channel} FREQUENCY {khz:06d} >')
             else:
                 self._send(f'< SET {channel} {cmd_type} {value} >')
+            return True
+        except (OSError, socket.error, ValueError):
+            return False
+
+# Shure UHF-R (UR4S/UR4D) "Command Strings" protocol -- an older, different
+# protocol from ULX-D/QLX-D. Confirmed live against a real UR4D: transport is
+# UDP (the source bulletin's "Connection: Ethernet (UPD/IP)" line is a typo --
+# verified empirically, since TCP gets no response at all), and messages are
+# '*'-delimited rather than '< >'.
+# https://content-files.shure.com/KnowledgeBaseFiles/uhfr-network-string-commands.pdf
+#   GET/SET  * GET/SET x PARAM [value] *  ->  * REPORT x PARAM value *
+#   metering: * METER x ALL sss * (sss = speed in 30ms steps) enables periodic
+#     * SAMPLE x ALL nn aaa bbb d eee *
+#   nn=antenna LEDs; aaa/bbb=RF level per antenna (coarse category, NOT dBm:
+#     020=overload, 070=strong ... 100=weak); d=battery 1-5/U; eee=audio 0-255
+# "x" is the channel: "1" (single/UR4S or left) or "2" (right, UR4D only).
+UHFR_METER_STEPS = 40  # 40 * 30ms ~= 1.2s update interval
+UHFR_MISS_LIMIT = 5    # consecutive empty polls before considering it unreachable
+
+class UHFRProvider(BaseProvider):
+    def __init__(self, ip, device_type, photo=None, channel=1):
+        super().__init__(ip, device_type, photo)
+        self.channel = channel
+        self.sock = None
+        self._metering_started = False
+        self._miss_count = 0
+
+    def connect(self):
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.settimeout(0.5)
+            # UDP has no handshake -- poll() confirms real reachability by
+            # tracking consecutive misses, rather than trusting this socket().
+            self.status = 'CONNECTED'
+            self._metering_started = False
+            self._miss_count = 0
+        except Exception:
+            self.status = 'DISCONNECTED'
+
+    def disconnect(self):
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
+        self.status = 'DISCONNECTED'
+
+    def _send(self, message):
+        self.sock.sendto(message.encode('ascii'), (self.ip, 2202))
+
+    def _read_messages(self, timeout=0.4, max_reads=8):
+        """UHF-R sends one UDP datagram per '* ... *' message; drain up to
+        max_reads of them within timeout."""
+        self.sock.settimeout(timeout)
+        messages = []
+        for _ in range(max_reads):
+            try:
+                data, _ = self.sock.recvfrom(4096)
+            except socket.timeout:
+                break
+            text = data.decode('ascii', errors='ignore')
+            start = text.find('*')
+            end = text.rfind('*')
+            if start != -1 and end > start:
+                messages.append(text[start + 1:end].strip())
+        return messages
+
+    def _apply_report(self, param, value):
+        value = value.strip()
+        if param == 'TX_BAT':
+            # 1-5 bars -> rough 0-100; 'U' = undefined (transmitter off/absent)
+            self.metrics['batt'] = None if value == 'U' else int(value) * 20
+        elif param == 'FREQUENCY':
+            try: self.metrics['frequency_mhz'] = int(value) / 1000
+            except ValueError: pass
+
+    def _parse_messages(self, messages):
+        if messages:
+            self._miss_count = 0
+        for msg in messages:
+            parts = msg.split()
+            if not parts:
+                continue
+            if parts[0] == 'SAMPLE' and len(parts) >= 8:
+                # SAMPLE x ALL nn aaa bbb d eee
+                if parts[1] != str(self.channel):
+                    continue
+                try:
+                    aaa, bbb = int(parts[4]), int(parts[5])
+                    audio_raw = int(parts[7])
+                except (ValueError, IndexError):
+                    continue
+                strongest = min(aaa, bbb)
+                if strongest <= 20:
+                    alert = 'RF Overload'
+                    if not self.alerts or self.alerts[-1] != alert:
+                        self.alerts.append(alert)
+                        self.alerts = self.alerts[-20:]
+                    quality = 20
+                else:
+                    quality = max(0, 100 - strongest)
+                self.metrics['rf'] = quality
+                self.metrics['audio'] = round(audio_raw / 255 * 100)
+                continue
+            if parts[0] != 'REPORT' or len(parts) < 2:
+                continue
+            rest = parts[1:]
+            if rest[0].isdigit():
+                if len(rest) < 3 or rest[0] != str(self.channel):
+                    continue
+                self._apply_report(rest[1], ' '.join(rest[2:]))
+            else:
+                self._apply_report(rest[0], ' '.join(rest[1:]))
+
+    def poll(self):
+        if self.status != 'CONNECTED': return
+        try:
+            if not self._metering_started:
+                self._send(f'* METER {self.channel} ALL {UHFR_METER_STEPS:03d} *')
+                self._metering_started = True
+            self._send(f'* GET {self.channel} TX_BAT *')
+            self._send(f'* GET {self.channel} FREQUENCY *')
+            messages = self._read_messages()
+            self._parse_messages(messages)
+            if not messages:
+                self._miss_count += 1
+                if self._miss_count >= UHFR_MISS_LIMIT:
+                    self.status = 'DISCONNECTED'
+                    return
+
+            batt = self.metrics.get('batt')
+            if batt is not None and batt < 20:
+                alert = f"Low Battery: {batt}%"
+                if not self.alerts or self.alerts[-1] != alert:
+                    self.alerts.append(alert)
+                    self.alerts = self.alerts[-20:]
+        except (OSError, socket.error):
+            self.status = 'DISCONNECTED'
+
+    def scan_rf(self):
+        # No wideband scan in this documented protocol either.
+        self.spectrum_data = []
+
+    def send_command(self, cmd_type, value, channel=1):
+        if self.status != 'CONNECTED': return False
+        try:
+            if cmd_type == 'MUTE':
+                self._send(f'* SET {channel} MUTE {"ON" if value else "OFF"} *')
+            elif cmd_type == 'FREQUENCY':
+                khz = int(round(float(value) * 1000))
+                self._send(f'* SET {channel} FREQUENCY {khz:06d} *')
+            else:
+                self._send(f'* SET {channel} {cmd_type} {value} *')
             return True
         except (OSError, socket.error, ValueError):
             return False
