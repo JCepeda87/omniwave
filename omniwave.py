@@ -14,7 +14,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from tornado.ioloop import IOLoop
 from tornado.web import Application, RequestHandler
-from providers import ShureProvider, SennheiserProvider, UHFRProvider
+from providers import ShureProvider, SennheiserProvider, UHFRProvider, PSM1000Provider
 import spectrum_planner
 
 # --- CONFIGURATION ---
@@ -32,7 +32,11 @@ DB_PATH = 'omniwave_history.db'
 
 def make_provider(ip, brand, dtype, channel=1):
     if brand == 'shure':
-        return UHFRProvider(ip, dtype, channel=channel) if dtype == 'uhf-r' else ShureProvider(ip, dtype, channel=channel)
+        if dtype == 'uhf-r':
+            return UHFRProvider(ip, dtype, channel=channel)
+        if dtype == 'psm1000':
+            return PSM1000Provider(ip, dtype, channel=channel)
+        return ShureProvider(ip, dtype, channel=channel)
     return SennheiserProvider(ip, dtype)
 
 # Columns the metrics table must have. Add a new provider metric here (and it
@@ -95,7 +99,7 @@ class DataHandler(RequestHandler):
         for ip, dev in Devices.items():
             entry = dev.get_json()
             entry['name'] = DeviceNames.get(ip, '')
-            entry['brand'] = 'shure' if isinstance(dev, (ShureProvider, UHFRProvider)) else 'sennheiser'
+            entry['brand'] = 'shure' if isinstance(dev, (ShureProvider, UHFRProvider, PSM1000Provider)) else 'sennheiser'
             # Prefer the live, hardware-reported frequency (real Shure gear
             # reports this every poll) over the locally-assigned one, so the
             # UI reflects what's actually on air rather than stale bookkeeping.

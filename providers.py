@@ -342,6 +342,90 @@ class UHFRProvider(BaseProvider):
         except (OSError, socket.error, ValueError):
             return False
 
+# Shure PSM1000 (P10T transmitter) network telemetry -- confirmed live
+# against real hardware, but there is no public command-strings reference
+# for this product the way there is for ULX-D/QLX-D/UHF-R. Unlike all of
+# those, this is pure one-way push: the moment you connect on TCP port
+# 2202 it continuously streams
+#   < REPORT x AUDIO_IN_LVL_L yyy >
+#   < REPORT x AUDIO_IN_LVL_R yyy >
+# and does not respond to any GET/SET command tried, in either '< >' or
+# '*' delimiter style, over TCP or UDP. So only what's actually observed
+# on the wire is implemented -- no battery/frequency/RF, since the P10T
+# exposes none of that here (it's a transmitter base station, not a
+# receiver, so those wouldn't mean the same thing even if they existed).
+PSM1000_ASSUMED_MAX = 1023  # no documented scale; treated as a rough 10-bit meter
+
+class PSM1000Provider(BaseProvider):
+    def __init__(self, ip, device_type, photo=None, channel=1):
+        super().__init__(ip, device_type, photo)
+        self.channel = channel
+        self.sock = None
+        self._buffer = ''
+
+    def connect(self):
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(0.5)
+            self.sock.connect((self.ip, 2202))
+            self.status = 'CONNECTED'
+            self._buffer = ''
+        except Exception:
+            self.status = 'DISCONNECTED'
+
+    def disconnect(self):
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
+        self.status = 'DISCONNECTED'
+
+    def _read_messages(self, timeout=0.4):
+        self.sock.settimeout(timeout)
+        try:
+            chunk = self.sock.recv(8192)
+            if chunk:
+                self._buffer += chunk.decode('ascii', errors='ignore')
+        except socket.timeout:
+            pass
+        messages = []
+        while True:
+            start = self._buffer.find('<')
+            end = self._buffer.find('>', start)
+            if start == -1 or end == -1:
+                break
+            messages.append(self._buffer[start + 1:end].strip())
+            self._buffer = self._buffer[end + 1:]
+        return messages
+
+    def poll(self):
+        if self.status != 'CONNECTED': return
+        try:
+            left = right = None
+            for msg in self._read_messages():
+                parts = msg.split()
+                if len(parts) < 4 or parts[0] != 'REPORT' or parts[1] != str(self.channel):
+                    continue
+                try:
+                    value = int(parts[3])
+                except ValueError:
+                    continue
+                if parts[2] == 'AUDIO_IN_LVL_L':
+                    left = value
+                elif parts[2] == 'AUDIO_IN_LVL_R':
+                    right = value
+            readings = [v for v in (left, right) if v is not None]
+            if readings:
+                peak = min(max(readings), PSM1000_ASSUMED_MAX)
+                self.metrics['audio'] = round(peak / PSM1000_ASSUMED_MAX * 100)
+        except (OSError, socket.error):
+            self.status = 'DISCONNECTED'
+
+    def scan_rf(self):
+        self.spectrum_data = []
+
+    def send_command(self, cmd_type, value, channel=1):
+        return False  # no responsive control channel found for this device
+
 class SennheiserProvider(BaseProvider):
     def __init__(self, ip, device_type, photo=None):
         super().__init__(ip, device_type, photo)
