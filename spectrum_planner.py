@@ -155,23 +155,47 @@ def suggest_frequencies(region_key, occupied_tv_channels, existing_mhz, count,
                          min_spacing_mhz=MIN_SPACING_MHZ_DEFAULT,
                          im_margin_khz=IM_MARGIN_KHZ_DEFAULT,
                          step_khz=SUGGEST_STEP_KHZ_DEFAULT,
-                         extra_excluded_ranges=None):
-    """Greedily pick `count` new frequencies inside the region's usable
-    spectrum that keep min_spacing_mhz from, and avoid 3rd-order IM
-    conflicts with, everything already in `existing_mhz` and each other."""
+                         extra_excluded_ranges=None,
+                         near_mhz=None):
+    """Pick `count` new frequencies inside the region's usable spectrum
+    that keep min_spacing_mhz from, and avoid 3rd-order IM conflicts
+    with, everything already in `existing_mhz` and each other.
+
+    Scans low-to-high by default. If `near_mhz` is given, picks the
+    closest valid frequencies to that point instead -- e.g. replacing
+    one device's frequency with minimal disruption to where it already
+    sits in the band, rather than jumping to the bottom of the range."""
     ranges = usable_ranges(region_key, occupied_tv_channels, extra_excluded_ranges)
     step = step_khz / 1000
     margin_mhz = im_margin_khz / 1000
     chosen = list(existing_mhz)
     suggested = []
+
+    if near_mhz is None:
+        for (lo, hi) in ranges:
+            f = lo
+            while f <= hi and len(suggested) < count:
+                candidate = round(f, 4)
+                if not _conflicts_with_set(candidate, chosen, min_spacing_mhz, margin_mhz):
+                    chosen.append(candidate)
+                    suggested.append(candidate)
+                f += step
+            if len(suggested) >= count:
+                break
+        return suggested
+
+    candidates = []
     for (lo, hi) in ranges:
         f = lo
-        while f <= hi and len(suggested) < count:
-            candidate = round(f, 4)
-            if not _conflicts_with_set(candidate, chosen, min_spacing_mhz, margin_mhz):
-                chosen.append(candidate)
-                suggested.append(candidate)
+        while f <= hi:
+            candidates.append(round(f, 4))
             f += step
+    candidates.sort(key=lambda c: abs(c - near_mhz))
+
+    for candidate in candidates:
         if len(suggested) >= count:
             break
+        if not _conflicts_with_set(candidate, chosen, min_spacing_mhz, margin_mhz):
+            chosen.append(candidate)
+            suggested.append(candidate)
     return suggested

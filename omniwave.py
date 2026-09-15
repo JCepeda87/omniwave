@@ -577,12 +577,17 @@ class RegionsHandler(RequestHandler):
             }
         self.write(json.dumps(out))
 
-def _active_device_frequencies():
+def _active_device_frequencies(exclude_ip=None):
     """Every device's best-known frequency: the live hardware reading when
     available (so coordination always accounts for what's actually on air),
-    falling back to the locally-assigned one for devices that don't report it."""
+    falling back to the locally-assigned one for devices that don't report it.
+    `exclude_ip` leaves one device's own frequency out -- e.g. when finding a
+    replacement for that exact device, its old value shouldn't count as a
+    conflict against the new one."""
     freqs = []
     for ip, dev in Devices.items():
+        if ip == exclude_ip:
+            continue
         freq = dev.metrics.get('frequency_mhz', DeviceFrequencies.get(ip))
         if freq is not None:
             freqs.append(freq)
@@ -624,12 +629,15 @@ class CoordinationSuggestHandler(RequestHandler):
         count = max(1, min(int(params.get('count', 1)), 50))
         min_spacing_mhz = float(params.get('min_spacing_khz', spectrum_planner.MIN_SPACING_MHZ_DEFAULT * 1000)) / 1000
         im_margin_khz = float(params.get('im_margin_khz', spectrum_planner.IM_MARGIN_KHZ_DEFAULT))
+        near_mhz = params.get('near_mhz')
+        near_mhz = float(near_mhz) if near_mhz not in (None, '') else None
+        exclude_ip = params.get('exclude_ip')
 
-        existing = _active_device_frequencies() + extra
+        existing = _active_device_frequencies(exclude_ip=exclude_ip) + extra
         suggested = spectrum_planner.suggest_frequencies(
             region, occupied, existing, count,
             min_spacing_mhz=min_spacing_mhz, im_margin_khz=im_margin_khz,
-            extra_excluded_ranges=scan_exclusions)
+            extra_excluded_ranges=scan_exclusions, near_mhz=near_mhz)
         self.write(json.dumps({'suggested_mhz': suggested}))
 
 class ScanExclusionsHandler(RequestHandler):
