@@ -17,6 +17,12 @@ from collections import defaultdict
 #     aaa = RF level 000-115 (subtract 128 for dBm); eee = audio level 000-050
 # "x" is the channel (1-4 on multi-channel receivers; 0 means "all channels").
 
+# Confirming a SET needs a longer read window than a routine poll: a device
+# with metering already running (poll() enables it on first connect) is
+# also pushing an unsolicited SAMPLE roughly once a second, so there can be
+# real backlog to drain through before the actual confirmation shows up.
+CONFIRM_READ_TIMEOUT = 1.2
+
 class BaseProvider(ABC):
     def __init__(self, ip, device_type, photo=None):
         self.ip = ip
@@ -81,16 +87,35 @@ class ShureProvider(BaseProvider):
     def _send(self, message):
         self.sock.sendall(message.encode('ascii'))
 
-    def _read_messages(self, timeout=0.4):
-        """Read whatever arrives within `timeout` and split it into complete
-        '< ... >' command strings."""
-        self.sock.settimeout(timeout)
-        try:
-            chunk = self.sock.recv(4096)
-            if chunk:
+    def _read_messages(self, timeout=0.4, stop_early=True):
+        """Read whatever arrives within `timeout`, split into complete
+        '< ... >' command strings. Drains in short sub-reads rather than a
+        single recv() -- a response split across TCP segments, or one that
+        lands a beat after a SET, would otherwise get left in the kernel
+        buffer for whatever the *next* call happens to be (e.g. the next
+        poll cycle), which is exactly wrong when this call is checking for
+        a specific command's own confirmation.
+
+        stop_early=True (poll()'s use) returns as soon as a quiet gap
+        follows some data, since polling doesn't need the full window.
+        stop_early=False (send_command()'s confirmation reads) keeps
+        draining for the whole timeout regardless of gaps -- an
+        unrelated SAMPLE can arrive first with a real pause before the
+        actual confirmation shows up, and bailing on that gap was
+        exactly the bug that made confirmation reads flaky."""
+        deadline = time.time() + timeout
+        self.sock.settimeout(0.1)
+        got_any = False
+        while time.time() < deadline:
+            try:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    break
                 self._buffer += chunk.decode('ascii', errors='ignore')
-        except socket.timeout:
-            pass
+                got_any = True
+            except socket.timeout:
+                if stop_early and got_any:
+                    break
         messages = []
         while True:
             start = self._buffer.find('<')
@@ -116,6 +141,8 @@ class ShureProvider(BaseProvider):
             except ValueError: pass
         elif param == 'MODEL':
             self.model = value.strip('{}').strip()
+        elif param == 'AUDIO_MUTE':
+            self.metrics['muted'] = (value == 'ON')
         elif param == 'RF_INT_DET' and value == 'CRITICAL':
             alert = 'RF Interference Detected'
             if not self.alerts or self.alerts[-1] != alert:
@@ -178,16 +205,23 @@ class ShureProvider(BaseProvider):
         self.spectrum_data = []
 
     def send_command(self, cmd_type, value, channel=1):
+        """Sends the SET and reads back the receiver's own REP confirmation
+        before reporting success -- a successful socket write only means the
+        bytes went out, not that the hardware actually applied the change."""
         if self.status != 'CONNECTED': return False
         try:
             if cmd_type == 'MUTE':
                 self._send(f'< SET {channel} AUDIO_MUTE {"ON" if value else "OFF"} >')
+                self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
+                return self.metrics.get('muted') == bool(value)
             elif cmd_type == 'FREQUENCY':
                 khz = int(round(float(value) * 1000))
                 self._send(f'< SET {channel} FREQUENCY {khz:06d} >')
+                self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
+                return self.metrics.get('frequency_mhz') == round(khz / 1000, 4)
             else:
                 self._send(f'< SET {channel} {cmd_type} {value} >')
-            return True
+                return True
         except (OSError, socket.error, ValueError):
             return False
 
@@ -235,16 +269,32 @@ class UHFRProvider(BaseProvider):
     def _send(self, message):
         self.sock.sendto(message.encode('ascii'), (self.ip, 2202))
 
-    def _read_messages(self, timeout=0.4, max_reads=8):
-        """UHF-R sends one UDP datagram per '* ... *' message; drain up to
-        max_reads of them within timeout."""
-        self.sock.settimeout(timeout)
+    def _read_messages(self, timeout=0.4, max_reads=8, stop_early=True):
+        """UHF-R sends one UDP datagram per '* ... *' message, bounded by
+        the overall `timeout` budget either way (not `timeout` per read --
+        that could add up to max_reads * timeout for a slow trickle).
+
+        stop_early=True (poll()'s use) gives up as soon as one read times
+        out. stop_early=False (send_command()'s confirmation reads) keeps
+        retrying in short sub-reads for the whole budget -- an unrelated
+        SAMPLE arriving first can leave a real gap before the actual
+        confirmation shows up, and bailing on that gap was exactly the
+        bug that made confirmation reads flaky."""
+        deadline = time.time() + timeout
         messages = []
-        for _ in range(max_reads):
+        reads = 0
+        while reads < max_reads or not stop_early:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            self.sock.settimeout(remaining if stop_early else min(0.15, remaining))
             try:
                 data, _ = self.sock.recvfrom(4096)
             except socket.timeout:
-                break
+                if stop_early:
+                    break
+                continue
+            reads += 1
             text = data.decode('ascii', errors='ignore')
             start = text.find('*')
             end = text.rfind('*')
@@ -260,6 +310,8 @@ class UHFRProvider(BaseProvider):
         elif param == 'FREQUENCY':
             try: self.metrics['frequency_mhz'] = int(value) / 1000
             except ValueError: pass
+        elif param == 'MUTE':
+            self.metrics['muted'] = (value == 'ON')
 
     def _parse_messages(self, messages):
         if messages:
@@ -329,16 +381,22 @@ class UHFRProvider(BaseProvider):
         self.spectrum_data = []
 
     def send_command(self, cmd_type, value, channel=1):
+        """Sends the SET and reads back the receiver's own REPORT
+        confirmation before reporting success, same as ShureProvider."""
         if self.status != 'CONNECTED': return False
         try:
             if cmd_type == 'MUTE':
                 self._send(f'* SET {channel} MUTE {"ON" if value else "OFF"} *')
+                self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
+                return self.metrics.get('muted') == bool(value)
             elif cmd_type == 'FREQUENCY':
                 khz = int(round(float(value) * 1000))
                 self._send(f'* SET {channel} FREQUENCY {khz:06d} *')
+                self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
+                return self.metrics.get('frequency_mhz') == round(khz / 1000, 4)
             else:
                 self._send(f'* SET {channel} {cmd_type} {value} *')
-            return True
+                return True
         except (OSError, socket.error, ValueError):
             return False
 
