@@ -25,6 +25,17 @@ from collections import defaultdict
 # real backlog to drain through before the actual confirmation shows up.
 CONFIRM_READ_TIMEOUT = 1.2
 
+# A dead network doesn't always fail loudly: an established TCP socket often
+# accepts writes and simply times out on reads instead of raising -- so a
+# provider that only flips to DISCONNECTED on a hard socket error can stay
+# "CONNECTED" (with frozen, increasingly stale metrics) indefinitely once its
+# network path is gone. Every polling provider below instead counts
+# consecutive empty poll cycles and, past this limit, marks itself
+# disconnected AND clears its metrics -- so a device the app can no longer
+# actually hear from stops showing battery/RF/audio levels instead of
+# silently repeating the last numbers it happened to have.
+NETWORK_MISS_LIMIT = 5
+
 class BaseProvider(ABC):
     def __init__(self, ip, device_type, photo=None):
         self.ip = ip
@@ -74,6 +85,7 @@ class ShureProvider(BaseProvider):
         self.model = None
         self._buffer = ''
         self._metering_started = False
+        self._miss_count = 0
 
     def connect(self):
         with self._io_lock:
@@ -84,8 +96,15 @@ class ShureProvider(BaseProvider):
                 self.status = 'CONNECTED'
                 self._metering_started = False
                 self._buffer = ''
+                self._miss_count = 0
             except Exception:
                 self.status = 'DISCONNECTED'
+
+    def _mark_unreachable(self):
+        self.status = 'DISCONNECTED'
+        self.metrics = {}
+        self._metering_started = False
+        self._miss_count = 0
 
     def disconnect(self):
         with self._io_lock:
@@ -197,7 +216,15 @@ class ShureProvider(BaseProvider):
                     self._metering_started = True
                 self._send(f'< GET {self.channel} BATT_CHARGE >')
                 self._send(f'< GET {self.channel} FREQUENCY >')
-                self._parse_messages(self._read_messages())
+                messages = self._read_messages()
+                self._parse_messages(messages)
+                if not messages:
+                    self._miss_count += 1
+                    if self._miss_count >= NETWORK_MISS_LIMIT:
+                        self._mark_unreachable()
+                        return
+                else:
+                    self._miss_count = 0
 
                 batt = self.metrics.get('batt')
                 if batt is not None and batt < 20:
@@ -206,7 +233,7 @@ class ShureProvider(BaseProvider):
                         self.alerts.append(alert)
                         self.alerts = self.alerts[-20:]
             except (OSError, socket.error):
-                self.status = 'DISCONNECTED'
+                self._mark_unreachable()
 
     def scan_rf(self):
         # Wideband spectrum scanning isn't part of this documented ASCII
@@ -257,6 +284,12 @@ class UHFRProvider(BaseProvider):
         super().__init__(ip, device_type, photo)
         self.channel = channel
         self.sock = None
+        self._metering_started = False
+        self._miss_count = 0
+
+    def _mark_unreachable(self):
+        self.status = 'DISCONNECTED'
+        self.metrics = {}
         self._metering_started = False
         self._miss_count = 0
 
@@ -379,8 +412,10 @@ class UHFRProvider(BaseProvider):
                 if not messages:
                     self._miss_count += 1
                     if self._miss_count >= UHFR_MISS_LIMIT:
-                        self.status = 'DISCONNECTED'
+                        self._mark_unreachable()
                         return
+                else:
+                    self._miss_count = 0
 
                 batt = self.metrics.get('batt')
                 if batt is not None and batt < 20:
@@ -389,7 +424,7 @@ class UHFRProvider(BaseProvider):
                         self.alerts.append(alert)
                         self.alerts = self.alerts[-20:]
             except (OSError, socket.error):
-                self.status = 'DISCONNECTED'
+                self._mark_unreachable()
 
     def scan_rf(self):
         # No wideband scan in this documented protocol either.
@@ -436,6 +471,7 @@ class PSM1000Provider(BaseProvider):
         self.channel = channel
         self.sock = None
         self._buffer = ''
+        self._miss_count = 0
 
     def connect(self):
         with self._io_lock:
@@ -445,8 +481,14 @@ class PSM1000Provider(BaseProvider):
                 self.sock.connect((self.ip, 2202))
                 self.status = 'CONNECTED'
                 self._buffer = ''
+                self._miss_count = 0
             except Exception:
                 self.status = 'DISCONNECTED'
+
+    def _mark_unreachable(self):
+        self.status = 'DISCONNECTED'
+        self.metrics = {}
+        self._miss_count = 0
 
     def disconnect(self):
         with self._io_lock:
@@ -477,8 +519,9 @@ class PSM1000Provider(BaseProvider):
         if self.status != 'CONNECTED': return
         with self._io_lock:
             try:
+                messages = self._read_messages()
                 left = right = None
-                for msg in self._read_messages():
+                for msg in messages:
                     parts = msg.split()
                     if len(parts) < 4 or parts[0] != 'REPORT' or parts[1] != str(self.channel):
                         continue
@@ -494,8 +537,16 @@ class PSM1000Provider(BaseProvider):
                 if readings:
                     peak = min(max(readings), PSM1000_ASSUMED_MAX)
                     self.metrics['audio'] = round(peak / PSM1000_ASSUMED_MAX * 100)
+
+                if not messages:
+                    self._miss_count += 1
+                    if self._miss_count >= NETWORK_MISS_LIMIT:
+                        self._mark_unreachable()
+                        return
+                else:
+                    self._miss_count = 0
             except (OSError, socket.error):
-                self.status = 'DISCONNECTED'
+                self._mark_unreachable()
 
     def scan_rf(self):
         self.spectrum_data = []
@@ -524,6 +575,7 @@ class SLXDProvider(BaseProvider):
         self.model = None
         self._buffer = ''
         self._metering_started = False
+        self._miss_count = 0
 
     def connect(self):
         with self._io_lock:
@@ -534,8 +586,15 @@ class SLXDProvider(BaseProvider):
                 self.status = 'CONNECTED'
                 self._metering_started = False
                 self._buffer = ''
+                self._miss_count = 0
             except Exception:
                 self.status = 'DISCONNECTED'
+
+    def _mark_unreachable(self):
+        self.status = 'DISCONNECTED'
+        self.metrics = {}
+        self._metering_started = False
+        self._miss_count = 0
 
     def disconnect(self):
         with self._io_lock:
@@ -618,7 +677,15 @@ class SLXDProvider(BaseProvider):
                     self._metering_started = True
                 self._send(f'< GET {self.channel} TX_BATT_BARS >')
                 self._send(f'< GET {self.channel} FREQUENCY >')
-                self._parse_messages(self._read_messages())
+                messages = self._read_messages()
+                self._parse_messages(messages)
+                if not messages:
+                    self._miss_count += 1
+                    if self._miss_count >= NETWORK_MISS_LIMIT:
+                        self._mark_unreachable()
+                        return
+                else:
+                    self._miss_count = 0
 
                 batt = self.metrics.get('batt')
                 if batt is not None and batt < 20:
@@ -627,7 +694,7 @@ class SLXDProvider(BaseProvider):
                         self.alerts.append(alert)
                         self.alerts = self.alerts[-20:]
             except (OSError, socket.error):
-                self.status = 'DISCONNECTED'
+                self._mark_unreachable()
 
     def scan_rf(self):
         self.spectrum_data = []
@@ -670,6 +737,7 @@ class AxientDigitalProvider(BaseProvider):
         self.model = None
         self._buffer = ''
         self._metering_started = False
+        self._miss_count = 0
 
     def connect(self):
         with self._io_lock:
@@ -680,8 +748,15 @@ class AxientDigitalProvider(BaseProvider):
                 self.status = 'CONNECTED'
                 self._metering_started = False
                 self._buffer = ''
+                self._miss_count = 0
             except Exception:
                 self.status = 'DISCONNECTED'
+
+    def _mark_unreachable(self):
+        self.status = 'DISCONNECTED'
+        self.metrics = {}
+        self._metering_started = False
+        self._miss_count = 0
 
     def disconnect(self):
         with self._io_lock:
@@ -766,7 +841,15 @@ class AxientDigitalProvider(BaseProvider):
                     self._metering_started = True
                 self._send(f'< GET {self.channel} TX_BATT_CHARGE_PERCENT >')
                 self._send(f'< GET {self.channel} FREQUENCY >')
-                self._parse_messages(self._read_messages())
+                messages = self._read_messages()
+                self._parse_messages(messages)
+                if not messages:
+                    self._miss_count += 1
+                    if self._miss_count >= NETWORK_MISS_LIMIT:
+                        self._mark_unreachable()
+                        return
+                else:
+                    self._miss_count = 0
 
                 batt = self.metrics.get('batt')
                 if batt is not None and batt < 20:
@@ -775,7 +858,7 @@ class AxientDigitalProvider(BaseProvider):
                         self.alerts.append(alert)
                         self.alerts = self.alerts[-20:]
             except (OSError, socket.error):
-                self.status = 'DISCONNECTED'
+                self._mark_unreachable()
 
     def scan_rf(self):
         self.spectrum_data = []
@@ -823,6 +906,7 @@ class MXWProvider(BaseProvider):
         self.model = None
         self._buffer = ''
         self._metering_started = False
+        self._miss_count = 0
 
     def connect(self):
         with self._io_lock:
@@ -833,8 +917,15 @@ class MXWProvider(BaseProvider):
                 self.status = 'CONNECTED'
                 self._metering_started = False
                 self._buffer = ''
+                self._miss_count = 0
             except Exception:
                 self.status = 'DISCONNECTED'
+
+    def _mark_unreachable(self):
+        self.status = 'DISCONNECTED'
+        self.metrics = {}
+        self._metering_started = False
+        self._miss_count = 0
 
     def disconnect(self):
         with self._io_lock:
@@ -918,7 +1009,15 @@ class MXWProvider(BaseProvider):
                     self._metering_started = True
                 self._send(f'< GET {self.channel} BATT_CHARGE >')
                 self._send(f'< GET {self.channel} TX_STATUS >')
-                self._parse_messages(self._read_messages())
+                messages = self._read_messages()
+                self._parse_messages(messages)
+                if not messages:
+                    self._miss_count += 1
+                    if self._miss_count >= NETWORK_MISS_LIMIT:
+                        self._mark_unreachable()
+                        return
+                else:
+                    self._miss_count = 0
 
                 batt = self.metrics.get('batt')
                 if batt is not None and batt < 20:
@@ -927,7 +1026,7 @@ class MXWProvider(BaseProvider):
                         self.alerts.append(alert)
                         self.alerts = self.alerts[-20:]
             except (OSError, socket.error):
-                self.status = 'DISCONNECTED'
+                self._mark_unreachable()
 
     def scan_rf(self):
         self.spectrum_data = []
@@ -1019,12 +1118,18 @@ class SennheiserSSCProvider(BaseProvider):
         self.sock = None
         self.model = None
         self._buffer = ''
+        self._miss_count = 0
 
     def _rx(self):
         return f'rx{self.channel}'
 
     def _tx(self):
         return f'tx{self.channel}'
+
+    def _mark_unreachable(self):
+        self.status = 'DISCONNECTED'
+        self.metrics = {}
+        self._miss_count = 0
 
     def connect(self):
         with self._io_lock:
@@ -1034,6 +1139,7 @@ class SennheiserSSCProvider(BaseProvider):
                 self.sock.connect((self.ip, SSC_PORT))
                 self.status = 'CONNECTED'
                 self._buffer = ''
+                self._miss_count = 0
                 # Pull the real model string once, for display (identify_device()'s
                 # equivalent of ShureProvider's MODEL/DEVICE_ID parsing).
                 self._send({'device': {'identity': {'product': None}}})
@@ -1117,8 +1223,16 @@ class SennheiserSSCProvider(BaseProvider):
                     'mates': {tx: {'battery': {'gauge': None}}},
                 }
                 self._send(query)
-                for msg in self._read_messages():
+                messages = self._read_messages()
+                for msg in messages:
                     self._apply_message(msg)
+                if not messages:
+                    self._miss_count += 1
+                    if self._miss_count >= NETWORK_MISS_LIMIT:
+                        self._mark_unreachable()
+                        return
+                else:
+                    self._miss_count = 0
 
                 batt = self.metrics.get('batt')
                 if batt is not None and batt < 20:
@@ -1127,7 +1241,7 @@ class SennheiserSSCProvider(BaseProvider):
                         self.alerts.append(alert)
                         self.alerts = self.alerts[-20:]
             except (OSError, socket.error):
-                self.status = 'DISCONNECTED'
+                self._mark_unreachable()
 
     def scan_rf(self):
         # SSC exposes carrier metering per-channel, not a wideband scan --
