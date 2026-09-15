@@ -655,8 +655,8 @@ def poll_devices():
     for ip, dev in Devices.items():
         dev.poll()
         log_metrics(ip, dev.metrics)
-        batt = dev.metrics.get('batt', 100)
-        if batt < 15 and time.time() - _last_webhook_sent.get(ip, 0) > WEBHOOK_COOLDOWN_SECONDS:
+        batt = dev.metrics.get('batt')
+        if batt is not None and batt < 15 and time.time() - _last_webhook_sent.get(ip, 0) > WEBHOOK_COOLDOWN_SECONDS:
             send_webhook(f"CRITICAL LOW BATTERY: {ip} is at {batt}%")
             _last_webhook_sent[ip] = time.time()
     IOLoop.current().call_later(1, poll_devices)

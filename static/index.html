@@ -204,6 +204,11 @@
   }
   .chip-remove { background: none; border: none; color: inherit; padding: 0; font-size: 13px; cursor: pointer; }
   .device-freq-row { display: flex; align-items: center; gap: 4px; }
+  .spectrum-chart-wrap {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px; overflow-x: auto;
+  }
+  .spectrum-chart-wrap svg { display: block; width: 100%; height: 130px; }
 </style>
 </head>
 <body>
@@ -299,6 +304,17 @@
         <select id="regionSelect"></select>
       </div>
       <div class="device-meta" id="regionNotes" style="margin:8px 0"></div>
+
+      <h2 style="margin-top:16px">Spectrum View</h2>
+      <div class="device-meta" style="margin-bottom:8px">
+        Every connected device's real frequency plotted against TV channels and exclusions on one axis, so you
+        can see at a glance what's near what. A device marker turns red when it's flagged in the last
+        "Check for Conflicts" run. Run a scan below to overlay the actual measured RF trace.
+      </div>
+      <div class="spectrum-chart-wrap">
+        <svg id="spectrumChartSvg" viewBox="0 0 1000 130" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="freq-chip-row" id="spectrumChartLegend" style="margin-top:8px"></div>
 
       <h2 style="margin-top:16px">TV Channels <span style="font-weight:400">(click to mark occupied)</span></h2>
       <div class="tv-channel-grid" id="tvChannelGrid"></div>
@@ -640,6 +656,7 @@ async function refresh() {
   renderAlertsFeed(data);
   populateScanDeviceSelect();
   renderActiveFreqChips();
+  renderSpectrumChart();
 
   const ips = Object.keys(data);
   if (ips.length === 0) {
@@ -795,6 +812,7 @@ let lastImportedScanSpectrum = null;
 const scanExclusions = [];
 const manualExclusions = [];
 const lockedDevices = new Set();
+let lastConflicts = [];
 
 async function loadRegions() {
   regionsData = await fetch('/regions').then(r => r.json());
@@ -823,6 +841,7 @@ function renderRegionDetails() {
     html += `<button type="button" class="tv-ch ${occupiedChannels.has(ch) ? 'occupied' : ''}" title="${start}-${end} MHz" onclick="toggleChannel(${ch})">${ch}</button>`;
   }
   grid.innerHTML = html;
+  renderSpectrumChart();
 }
 
 function toggleChannel(ch) {
@@ -834,6 +853,95 @@ function deviceFrequencyEntries() {
   return Object.entries(lastData)
     .filter(([, d]) => d.frequency_mhz != null)
     .map(([ip, d]) => ({ ip, name: d.name || ip, frequency_mhz: d.frequency_mhz }));
+}
+
+const SPECTRUM_CHART_W = 1000, SPECTRUM_CHART_H = 130, SPECTRUM_CHART_BAND_TOP = 14, SPECTRUM_CHART_AXIS_Y = 96;
+
+function svgEscape(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function renderSpectrumChart() {
+  const svgEl = document.getElementById('spectrumChartSvg');
+  const region = regionsData[currentRegion];
+  if (!svgEl || !region) return;
+
+  const chartMin = region.tv_band_start_mhz;
+  const chartMax = region.tv_band_start_mhz + (region.tv_channel_end - region.tv_channel_start + 1) * region.tv_channel_width_mhz;
+  const toX = (freq) => ((freq - chartMin) / (chartMax - chartMin)) * SPECTRUM_CHART_W;
+  const top = SPECTRUM_CHART_BAND_TOP, axisY = SPECTRUM_CHART_AXIS_Y;
+
+  let bands = '';
+  for (let ch = region.tv_channel_start; ch <= region.tv_channel_end; ch++) {
+    const start = region.tv_band_start_mhz + (ch - region.tv_channel_start) * region.tv_channel_width_mhz;
+    const end = start + region.tv_channel_width_mhz;
+    const x1 = toX(start), x2 = toX(end);
+    const occupied = occupiedChannels.has(ch);
+    const fill = occupied ? 'var(--bad-dim)' : (ch % 2 === 0 ? 'var(--panel)' : 'transparent');
+    bands += `<rect x="${x1.toFixed(1)}" y="${top}" width="${Math.max(0.5, x2 - x1).toFixed(1)}" height="${axisY - top}" fill="${fill}" stroke="var(--border)" stroke-width="0.5"><title>Ch ${ch}: ${start}-${end} MHz${occupied ? ' (marked occupied)' : ''}</title></rect>`;
+  }
+
+  let exclusions = '';
+  scanExclusions.forEach(([lo, hi]) => {
+    const x1 = toX(lo), x2 = toX(hi);
+    exclusions += `<rect x="${x1.toFixed(1)}" y="${top}" width="${Math.max(1, x2 - x1).toFixed(1)}" height="${axisY - top}" fill="var(--warn-dim)"><title>Scan exclusion: ${lo.toFixed(3)}-${hi.toFixed(3)} MHz</title></rect>`;
+  });
+  manualExclusions.forEach(([lo, hi]) => {
+    const x1 = toX(lo), x2 = toX(hi);
+    exclusions += `<rect x="${x1.toFixed(1)}" y="${top}" width="${Math.max(1, x2 - x1).toFixed(1)}" height="${axisY - top}" fill="var(--accent-dim)"><title>Manual exclusion: ${lo.toFixed(3)}-${hi.toFixed(3)} MHz</title></rect>`;
+  });
+
+  let rfTrace = '';
+  if (lastScanSpectrum && lastScanSpectrum.length) {
+    const inRange = lastScanSpectrum.filter(p => p[0] >= chartMin && p[0] <= chartMax);
+    if (inRange.length > 1) {
+      const levels = inRange.map(p => p[1]);
+      const minL = Math.min(...levels), maxL = Math.max(...levels);
+      const range = (maxL - minL) || 1;
+      const points = inRange.map(p => {
+        const x = toX(p[0]);
+        const y = axisY - ((p[1] - minL) / range) * (axisY - top);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      }).join(' ');
+      rfTrace = `<polyline points="${points}" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.85"/>`;
+    }
+  }
+
+  const conflictFreqs = new Set(lastConflicts.map(c => c.frequency));
+  const entries = deviceFrequencyEntries();
+  let pins = '';
+  entries.forEach((d) => {
+    if (d.frequency_mhz < chartMin || d.frequency_mhz > chartMax) return;
+    const x = toX(d.frequency_mhz);
+    const conflict = conflictFreqs.has(d.frequency_mhz);
+    const color = conflict ? 'var(--bad)' : 'var(--ok)';
+    const label = svgEscape(`${d.name}: ${d.frequency_mhz.toFixed(3)} MHz${conflict ? ' — IM conflict' : ''}`);
+    pins += `<g><title>${label}</title>` +
+      `<line x1="${x.toFixed(1)}" y1="${top}" x2="${x.toFixed(1)}" y2="${axisY}" stroke="${color}" stroke-width="2"/>` +
+      `<circle cx="${x.toFixed(1)}" cy="${top}" r="3.5" fill="${color}"/>` +
+      `</g>`;
+  });
+
+  let axisLabels = '';
+  const step = chartMax - chartMin > 150 ? 50 : 20;
+  for (let f = Math.ceil(chartMin / step) * step; f <= chartMax; f += step) {
+    const x = toX(f);
+    axisLabels += `<text x="${x.toFixed(1)}" y="${axisY + 14}" font-size="9" fill="var(--muted)" text-anchor="middle">${f}</text>`;
+  }
+
+  svgEl.innerHTML =
+    `<line x1="0" y1="${axisY}" x2="${SPECTRUM_CHART_W}" y2="${axisY}" stroke="var(--border)" stroke-width="1"/>` +
+    bands + exclusions + rfTrace + pins + axisLabels;
+
+  const legendEl = document.getElementById('spectrumChartLegend');
+  if (legendEl) {
+    const sorted = [...entries].sort((a, b) => a.frequency_mhz - b.frequency_mhz);
+    legendEl.innerHTML = sorted.length ? sorted.map(d => {
+      const conflict = conflictFreqs.has(d.frequency_mhz);
+      const style = conflict ? 'background:var(--bad-dim);color:var(--bad)' : '';
+      return `<span class="freq-chip" style="${style}">${d.name}: ${d.frequency_mhz.toFixed(3)} MHz</span>`;
+    }).join('') : '<div class="empty" style="padding:8px">No devices with a known frequency yet.</div>';
+  }
 }
 
 function renderActiveFreqChips() {
@@ -910,6 +1018,7 @@ function setScanSpectrum(spectrum) {
       <button class="secondary" onclick="generateExclusions()">Generate Exclusions</button>
     </div>
     <div class="spectrum" style="margin-top:8px">${renderSpectrum(spectrum)}</div>`;
+  renderSpectrumChart();
 }
 
 async function generateExclusions() {
@@ -929,6 +1038,7 @@ function renderScanExclusionChips() {
   el.innerHTML = scanExclusions.length
     ? scanExclusions.map((r, i) => `<span class="freq-chip">${r[0].toFixed(3)}–${r[1].toFixed(3)} MHz <button class="chip-remove" onclick="removeScanExclusion(${i})">×</button></span>`).join('')
     : '<div class="empty" style="padding:8px">No scan-based exclusions yet.</div>';
+  renderSpectrumChart();
 }
 
 function removeScanExclusion(idx) {
@@ -956,6 +1066,7 @@ function renderManualExclusionChips() {
   el.innerHTML = manualExclusions.length
     ? manualExclusions.map((r, i) => `<span class="freq-chip">${r[0].toFixed(3)}–${r[1].toFixed(3)} MHz <button class="chip-remove" onclick="removeManualExclusion(${i})">×</button></span>`).join('')
     : '<div class="empty" style="padding:8px">No manual exclusions yet.</div>';
+  renderSpectrumChart();
 }
 
 function removeManualExclusion(idx) {
@@ -1023,11 +1134,13 @@ async function checkCoordination() {
   }).then(r => r.json());
 
   const conflicts = res.conflicts || [];
+  lastConflicts = conflicts;
   const conflictsHtml = conflicts.length
     ? conflicts.map(c => `<div class="alert-row">⚠ ${c.frequency.toFixed(3)} MHz conflicts with the intermodulation product of ${c.generated_by.map(f => f.toFixed(3)).join(' & ')} MHz</div>`).join('')
     : '<div class="device-meta" style="color:var(--ok)">No intermodulation conflicts detected among active frequencies.</div>';
   const rangesHtml = (res.usable_ranges_mhz || []).map(([lo, hi]) => `${lo.toFixed(1)}–${hi.toFixed(1)} MHz`).join(', ') || 'none';
   resultsEl.innerHTML = `<div class="device-meta" style="margin-bottom:8px"><b>Usable spectrum:</b> ${rangesHtml}</div>${conflictsHtml}`;
+  renderSpectrumChart();
 }
 
 async function suggestFrequencies() {
