@@ -322,11 +322,158 @@ def scan_subnet():
                 found.append({'ip': ip, 'brand': brand, 'port': port})
     return found
 
+def probe_host_udp_uhfr(ip):
+    """UHF-R only responds over UDP -- a plain TCP connect_ex() (scan_subnet's
+    check) never sees it, since UDP has no equivalent "is it listening"
+    probe short of actually speaking the protocol."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(DISCOVERY_TIMEOUT)
+            s.sendto(b'* GET 1 CHAN_NAME *', (ip, 2202))
+            s.recvfrom(4096)
+        return True
+    except OSError:
+        return False
+
+def scan_subnet_udp():
+    """Blocking; call via an executor. Finds UDP-only hosts (UHF-R) that
+    scan_subnet()'s TCP probe can't see."""
+    network = get_local_subnet()
+    hosts = list(network.hosts())
+    found = []
+    with ThreadPoolExecutor(max_workers=DISCOVERY_MAX_WORKERS) as pool:
+        futures = {pool.submit(probe_host_udp_uhfr, str(host)): str(host) for host in hosts}
+        for future in futures:
+            if future.result():
+                found.append({'ip': futures[future], 'brand': 'shure', 'port': 2202})
+    return found
+
+def scan_subnet_all():
+    """Blocking; call via an executor. TCP + UDP candidates combined,
+    deduplicated by IP (TCP result wins if a host somehow shows up in both)."""
+    combined = {}
+    for c in scan_subnet_udp() + scan_subnet():
+        combined[c['ip']] = c
+    return list(combined.values())
+
 class DiscoverHandler(RequestHandler):
     async def get(self):
-        candidates = await IOLoop.current().run_in_executor(None, scan_subnet)
+        candidates = await IOLoop.current().run_in_executor(None, scan_subnet_all)
         candidates = [c for c in candidates if c['ip'] not in Devices]
         self.write(json.dumps({'candidates': candidates}))
+
+# Real identification, not just "is the port open": speaks each protocol
+# we've actually implemented (ShureProvider's TCP command strings,
+# UHFRProvider's UDP one, PSM1000Provider's one-way push) well enough to
+# tell them apart, and pulls a real name off the wire when one's available.
+IDENTIFY_TIMEOUT = 0.6
+DEVICE_ID_RE = re.compile(r'DEVICE_ID \{([^}]*)\}')
+MODEL_RE = re.compile(r'MODEL \{([^}]*)\}')
+
+def _drain_tcp(sock, seconds):
+    """A single recv() can catch a multi-line '< GET x ALL >' reply
+    mid-burst; keep reading until the window closes instead."""
+    sock.settimeout(0.15)
+    deadline = time.time() + seconds
+    chunks = []
+    while time.time() < deadline:
+        try:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        except socket.timeout:
+            if chunks:
+                break
+    return b''.join(chunks).decode('ascii', errors='ignore')
+
+def identify_device(ip):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(IDENTIFY_TIMEOUT)
+            s.connect((ip, 2202))
+            s.sendall(b'< GET 1 ALL >')
+            text = _drain_tcp(s, IDENTIFY_TIMEOUT)
+        if 'AUDIO_IN_LVL' in text:
+            return {'brand': 'shure', 'type': 'psm1000', 'label': 'PSM1000 (P10T)', 'name': None}
+        device_id = DEVICE_ID_RE.search(text)
+        model = MODEL_RE.search(text)
+        raw = (device_id.group(1) if device_id else (model.group(1) if model else '')).strip()
+        if 'ULXD' in text or raw.startswith('ULXD'):
+            return {'brand': 'shure', 'type': 'ulxd', 'label': 'ULX-D', 'name': raw or None}
+        if 'QLXD' in text or raw.startswith('QLXD'):
+            return {'brand': 'shure', 'type': 'qlxd', 'label': 'QLX-D', 'name': raw or None}
+        if '<' in text and 'REP' in text:
+            return {'brand': 'shure', 'type': 'custom', 'label': 'Shure (unidentified model)', 'name': raw or None}
+    except OSError:
+        pass
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(IDENTIFY_TIMEOUT)
+            s.sendto(b'* GET 1 CHAN_NAME *', (ip, 2202))
+            data, _ = s.recvfrom(4096)
+        text = data.decode('ascii', errors='ignore')
+        if 'REPORT' in text:
+            parts = text.strip('* \r\n').split()
+            name = parts[3] if len(parts) >= 4 else None
+            return {'brand': 'shure', 'type': 'uhf-r', 'label': 'UHF-R (UR4D/UR4S)', 'name': name}
+    except OSError:
+        pass
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(DISCOVERY_TIMEOUT)
+            if s.connect_ex((ip, 45)) == 0:
+                return {'brand': 'sennheiser', 'type': 'ew-g4', 'label': 'Sennheiser (SSC port open)', 'name': None}
+    except OSError:
+        pass
+    return None
+
+AUTO_DISCOVERY_ENABLED = False
+AUTO_DISCOVERY_INTERVAL_SECONDS = 20
+
+def run_auto_discovery_scan():
+    """Blocking; call via an executor. Finds live hosts, identifies each one
+    for real, and returns only ones not already in Devices."""
+    found = []
+    for candidate in scan_subnet_all():
+        ip = candidate['ip']
+        if ip in Devices:
+            continue
+        info = identify_device(ip)
+        if info:
+            found.append({'ip': ip, **info})
+    return found
+
+async def auto_discovery_tick():
+    if AUTO_DISCOVERY_ENABLED:
+        try:
+            found = await IOLoop.current().run_in_executor(None, run_auto_discovery_scan)
+            for f in found:
+                ip = f['ip']
+                if ip in Devices:  # could've been added manually mid-scan
+                    continue
+                name = f.get('name') or f"{f['label']} ({ip})"
+                dev = make_provider(ip, f['brand'], f['type'], channel=1)
+                dev.connect()
+                Devices[ip] = dev
+                DeviceNames[ip] = name
+                save_device_to_config(ip, f['brand'], f['type'], name, 1)
+                print(f"Auto-discovery: added {name} at {ip}")
+        except Exception as e:
+            print(f"Auto-discovery tick failed: {e}")
+    IOLoop.current().call_later(AUTO_DISCOVERY_INTERVAL_SECONDS, lambda: IOLoop.current().spawn_callback(auto_discovery_tick))
+
+class AutoDiscoveryToggleHandler(RequestHandler):
+    def get(self):
+        self.write(json.dumps({'enabled': AUTO_DISCOVERY_ENABLED}))
+
+    def post(self):
+        global AUTO_DISCOVERY_ENABLED
+        params = json.loads(self.request.body)
+        AUTO_DISCOVERY_ENABLED = bool(params.get('enabled'))
+        self.write(json.dumps({'enabled': AUTO_DISCOVERY_ENABLED}))
 
 # --- Frequency plan / scan import -----------------------------------------
 # Shure and Sennheiser's native show-file formats (.wwb, .show) are
@@ -562,6 +709,7 @@ def main():
         (r'/devices/rename', RenameHandler),
         (r'/devices/frequency', FrequencyHandler),
         (r'/discover', DiscoverHandler),
+        (r'/discover/auto', AutoDiscoveryToggleHandler),
         (r'/import', ImportHandler),
         (r'/regions', RegionsHandler),
         (r'/coordination/check', CoordinationCheckHandler),
@@ -583,6 +731,7 @@ def main():
             DeviceFrequencies[ip] = dev_cfg['frequency_mhz']
 
     poll_devices()
+    IOLoop.current().spawn_callback(auto_discovery_tick)
     print(f"OmniWave OS v{VERSION} running on 0.0.0.0:9000...")
     IOLoop.current().start()
 

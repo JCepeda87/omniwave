@@ -251,14 +251,23 @@
 
       <h2 style="margin-top:20px">Auto Discovery</h2>
       <div class="device-meta" style="margin-bottom:10px">
-        Probes your local network for hosts responding on known Shure (2202) / Sennheiser SSC (45) control ports.
-        This is a heuristic port scan, not the brands' certified SLP/mDNS discovery.
+        Probes your local network for hosts responding on known Shure (2202) / Sennheiser SSC (45) control ports,
+        then actually speaks each protocol this app knows (ULX-D/QLX-D command strings, UHF-R, PSM1000) to identify
+        what it really is, pulling its real name off the wire when available.
       </div>
       <div class="discovery-controls">
         <button id="scanBtn" class="secondary" onclick="scanNetwork()">Scan Network</button>
         <span class="device-meta" id="scanStatus"></span>
       </div>
       <div class="discovery-results" id="discoveryResults"></div>
+
+      <div class="coord-row" style="margin-top:14px; gap:10px">
+        <button id="autoDiscoveryToggle" class="secondary" onclick="toggleAutoDiscovery()">Enable Auto-Add</button>
+        <span class="device-meta">
+          When on, rescans every 20s and automatically adds any newly identified, not-yet-added unit to this
+          session — no manual "Add" click needed.
+        </span>
+      </div>
 
       <h2 style="margin-top:20px">Import Frequency Plan</h2>
       <div class="device-meta" style="margin-bottom:10px">
@@ -464,6 +473,28 @@ async function addDiscovered(ip, brand, idx) {
   });
   refresh();
   scanNetwork();
+}
+
+async function loadAutoDiscoveryState() {
+  const res = await fetch('/discover/auto').then(r => r.json());
+  renderAutoDiscoveryToggle(res.enabled);
+}
+
+function renderAutoDiscoveryToggle(enabled) {
+  const btn = document.getElementById('autoDiscoveryToggle');
+  if (!btn) return;
+  btn.textContent = enabled ? '⏸ Disable Auto-Add' : '▶ Enable Auto-Add';
+  btn.classList.toggle('live', enabled);
+}
+
+async function toggleAutoDiscovery() {
+  const btn = document.getElementById('autoDiscoveryToggle');
+  const currentlyOn = btn.textContent.includes('Disable');
+  const res = await fetch('/discover/auto', {
+    method: 'POST',
+    body: JSON.stringify({ enabled: !currentlyOn }),
+  }).then(r => r.json());
+  renderAutoDiscoveryToggle(res.enabled);
 }
 
 function renderSpectrum(spectrum) {
@@ -1057,6 +1088,7 @@ async function assignSuggested(freq, idx) {
 }
 
 loadRegions();
+loadAutoDiscoveryState();
 renderScanExclusionChips();
 renderManualExclusionChips();
 refresh();
