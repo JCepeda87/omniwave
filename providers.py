@@ -3,6 +3,7 @@ import time
 import socket
 import queue
 import logging
+import threading
 import requests
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -32,6 +33,12 @@ class BaseProvider(ABC):
         self.metrics = {}
         self.spectrum_data = []
         self.alerts = []
+        # Polling and a command can now run on different threads at once
+        # (both go through omniwave.py's DEVICE_EXECUTOR); this serializes
+        # any two operations against this *same* device's socket/buffer so
+        # they can't interleave and corrupt each other, while leaving other
+        # devices free to run fully in parallel.
+        self._io_lock = threading.Lock()
 
     @abstractmethod
     def connect(self): pass
@@ -68,21 +75,23 @@ class ShureProvider(BaseProvider):
         self._metering_started = False
 
     def connect(self):
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(0.5)
-            self.sock.connect((self.ip, 2202))
-            self.status = 'CONNECTED'
-            self._metering_started = False
-            self._buffer = ''
-        except Exception:
-            self.status = 'DISCONNECTED'
+        with self._io_lock:
+            try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.settimeout(0.5)
+                self.sock.connect((self.ip, 2202))
+                self.status = 'CONNECTED'
+                self._metering_started = False
+                self._buffer = ''
+            except Exception:
+                self.status = 'DISCONNECTED'
 
     def disconnect(self):
-        if self.sock:
-            try: self.sock.close()
-            except Exception: pass
-        self.status = 'DISCONNECTED'
+        with self._io_lock:
+            if self.sock:
+                try: self.sock.close()
+                except Exception: pass
+            self.status = 'DISCONNECTED'
 
     def _send(self, message):
         self.sock.sendall(message.encode('ascii'))
@@ -180,22 +189,23 @@ class ShureProvider(BaseProvider):
 
     def poll(self):
         if self.status != 'CONNECTED': return
-        try:
-            if not self._metering_started:
-                self._send(f'< SET {self.channel} METER_RATE 01000 >')
-                self._metering_started = True
-            self._send(f'< GET {self.channel} BATT_CHARGE >')
-            self._send(f'< GET {self.channel} FREQUENCY >')
-            self._parse_messages(self._read_messages())
+        with self._io_lock:
+            try:
+                if not self._metering_started:
+                    self._send(f'< SET {self.channel} METER_RATE 01000 >')
+                    self._metering_started = True
+                self._send(f'< GET {self.channel} BATT_CHARGE >')
+                self._send(f'< GET {self.channel} FREQUENCY >')
+                self._parse_messages(self._read_messages())
 
-            batt = self.metrics.get('batt')
-            if batt is not None and batt < 20:
-                alert = f"Low Battery: {batt}%"
-                if not self.alerts or self.alerts[-1] != alert:
-                    self.alerts.append(alert)
-                    self.alerts = self.alerts[-20:]
-        except (OSError, socket.error):
-            self.status = 'DISCONNECTED'
+                batt = self.metrics.get('batt')
+                if batt is not None and batt < 20:
+                    alert = f"Low Battery: {batt}%"
+                    if not self.alerts or self.alerts[-1] != alert:
+                        self.alerts.append(alert)
+                        self.alerts = self.alerts[-20:]
+            except (OSError, socket.error):
+                self.status = 'DISCONNECTED'
 
     def scan_rf(self):
         # Wideband spectrum scanning isn't part of this documented ASCII
@@ -209,21 +219,22 @@ class ShureProvider(BaseProvider):
         before reporting success -- a successful socket write only means the
         bytes went out, not that the hardware actually applied the change."""
         if self.status != 'CONNECTED': return False
-        try:
-            if cmd_type == 'MUTE':
-                self._send(f'< SET {channel} AUDIO_MUTE {"ON" if value else "OFF"} >')
-                self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
-                return self.metrics.get('muted') == bool(value)
-            elif cmd_type == 'FREQUENCY':
-                khz = int(round(float(value) * 1000))
-                self._send(f'< SET {channel} FREQUENCY {khz:06d} >')
-                self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
-                return self.metrics.get('frequency_mhz') == round(khz / 1000, 4)
-            else:
-                self._send(f'< SET {channel} {cmd_type} {value} >')
-                return True
-        except (OSError, socket.error, ValueError):
-            return False
+        with self._io_lock:
+            try:
+                if cmd_type == 'MUTE':
+                    self._send(f'< SET {channel} AUDIO_MUTE {"ON" if value else "OFF"} >')
+                    self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
+                    return self.metrics.get('muted') == bool(value)
+                elif cmd_type == 'FREQUENCY':
+                    khz = int(round(float(value) * 1000))
+                    self._send(f'< SET {channel} FREQUENCY {khz:06d} >')
+                    self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
+                    return self.metrics.get('frequency_mhz') == round(khz / 1000, 4)
+                else:
+                    self._send(f'< SET {channel} {cmd_type} {value} >')
+                    return True
+            except (OSError, socket.error, ValueError):
+                return False
 
 # Shure UHF-R (UR4S/UR4D) "Command Strings" protocol -- an older, different
 # protocol from ULX-D/QLX-D. Confirmed live against a real UR4D: transport is
@@ -249,22 +260,24 @@ class UHFRProvider(BaseProvider):
         self._miss_count = 0
 
     def connect(self):
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.settimeout(0.5)
-            # UDP has no handshake -- poll() confirms real reachability by
-            # tracking consecutive misses, rather than trusting this socket().
-            self.status = 'CONNECTED'
-            self._metering_started = False
-            self._miss_count = 0
-        except Exception:
-            self.status = 'DISCONNECTED'
+        with self._io_lock:
+            try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.sock.settimeout(0.5)
+                # UDP has no handshake -- poll() confirms real reachability
+                # by tracking consecutive misses, not by trusting socket().
+                self.status = 'CONNECTED'
+                self._metering_started = False
+                self._miss_count = 0
+            except Exception:
+                self.status = 'DISCONNECTED'
 
     def disconnect(self):
-        if self.sock:
-            try: self.sock.close()
-            except Exception: pass
-        self.status = 'DISCONNECTED'
+        with self._io_lock:
+            if self.sock:
+                try: self.sock.close()
+                except Exception: pass
+            self.status = 'DISCONNECTED'
 
     def _send(self, message):
         self.sock.sendto(message.encode('ascii'), (self.ip, 2202))
@@ -353,28 +366,29 @@ class UHFRProvider(BaseProvider):
 
     def poll(self):
         if self.status != 'CONNECTED': return
-        try:
-            if not self._metering_started:
-                self._send(f'* METER {self.channel} ALL {UHFR_METER_STEPS:03d} *')
-                self._metering_started = True
-            self._send(f'* GET {self.channel} TX_BAT *')
-            self._send(f'* GET {self.channel} FREQUENCY *')
-            messages = self._read_messages()
-            self._parse_messages(messages)
-            if not messages:
-                self._miss_count += 1
-                if self._miss_count >= UHFR_MISS_LIMIT:
-                    self.status = 'DISCONNECTED'
-                    return
+        with self._io_lock:
+            try:
+                if not self._metering_started:
+                    self._send(f'* METER {self.channel} ALL {UHFR_METER_STEPS:03d} *')
+                    self._metering_started = True
+                self._send(f'* GET {self.channel} TX_BAT *')
+                self._send(f'* GET {self.channel} FREQUENCY *')
+                messages = self._read_messages()
+                self._parse_messages(messages)
+                if not messages:
+                    self._miss_count += 1
+                    if self._miss_count >= UHFR_MISS_LIMIT:
+                        self.status = 'DISCONNECTED'
+                        return
 
-            batt = self.metrics.get('batt')
-            if batt is not None and batt < 20:
-                alert = f"Low Battery: {batt}%"
-                if not self.alerts or self.alerts[-1] != alert:
-                    self.alerts.append(alert)
-                    self.alerts = self.alerts[-20:]
-        except (OSError, socket.error):
-            self.status = 'DISCONNECTED'
+                batt = self.metrics.get('batt')
+                if batt is not None and batt < 20:
+                    alert = f"Low Battery: {batt}%"
+                    if not self.alerts or self.alerts[-1] != alert:
+                        self.alerts.append(alert)
+                        self.alerts = self.alerts[-20:]
+            except (OSError, socket.error):
+                self.status = 'DISCONNECTED'
 
     def scan_rf(self):
         # No wideband scan in this documented protocol either.
@@ -384,21 +398,22 @@ class UHFRProvider(BaseProvider):
         """Sends the SET and reads back the receiver's own REPORT
         confirmation before reporting success, same as ShureProvider."""
         if self.status != 'CONNECTED': return False
-        try:
-            if cmd_type == 'MUTE':
-                self._send(f'* SET {channel} MUTE {"ON" if value else "OFF"} *')
-                self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
-                return self.metrics.get('muted') == bool(value)
-            elif cmd_type == 'FREQUENCY':
-                khz = int(round(float(value) * 1000))
-                self._send(f'* SET {channel} FREQUENCY {khz:06d} *')
-                self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
-                return self.metrics.get('frequency_mhz') == round(khz / 1000, 4)
-            else:
-                self._send(f'* SET {channel} {cmd_type} {value} *')
-                return True
-        except (OSError, socket.error, ValueError):
-            return False
+        with self._io_lock:
+            try:
+                if cmd_type == 'MUTE':
+                    self._send(f'* SET {channel} MUTE {"ON" if value else "OFF"} *')
+                    self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
+                    return self.metrics.get('muted') == bool(value)
+                elif cmd_type == 'FREQUENCY':
+                    khz = int(round(float(value) * 1000))
+                    self._send(f'* SET {channel} FREQUENCY {khz:06d} *')
+                    self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
+                    return self.metrics.get('frequency_mhz') == round(khz / 1000, 4)
+                else:
+                    self._send(f'* SET {channel} {cmd_type} {value} *')
+                    return True
+            except (OSError, socket.error, ValueError):
+                return False
 
 # Shure PSM1000 (P10T transmitter) network telemetry -- confirmed live
 # against real hardware, but there is no public command-strings reference
@@ -422,20 +437,22 @@ class PSM1000Provider(BaseProvider):
         self._buffer = ''
 
     def connect(self):
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(0.5)
-            self.sock.connect((self.ip, 2202))
-            self.status = 'CONNECTED'
-            self._buffer = ''
-        except Exception:
-            self.status = 'DISCONNECTED'
+        with self._io_lock:
+            try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.settimeout(0.5)
+                self.sock.connect((self.ip, 2202))
+                self.status = 'CONNECTED'
+                self._buffer = ''
+            except Exception:
+                self.status = 'DISCONNECTED'
 
     def disconnect(self):
-        if self.sock:
-            try: self.sock.close()
-            except Exception: pass
-        self.status = 'DISCONNECTED'
+        with self._io_lock:
+            if self.sock:
+                try: self.sock.close()
+                except Exception: pass
+            self.status = 'DISCONNECTED'
 
     def _read_messages(self, timeout=0.4):
         self.sock.settimeout(timeout)
@@ -457,26 +474,27 @@ class PSM1000Provider(BaseProvider):
 
     def poll(self):
         if self.status != 'CONNECTED': return
-        try:
-            left = right = None
-            for msg in self._read_messages():
-                parts = msg.split()
-                if len(parts) < 4 or parts[0] != 'REPORT' or parts[1] != str(self.channel):
-                    continue
-                try:
-                    value = int(parts[3])
-                except ValueError:
-                    continue
-                if parts[2] == 'AUDIO_IN_LVL_L':
-                    left = value
-                elif parts[2] == 'AUDIO_IN_LVL_R':
-                    right = value
-            readings = [v for v in (left, right) if v is not None]
-            if readings:
-                peak = min(max(readings), PSM1000_ASSUMED_MAX)
-                self.metrics['audio'] = round(peak / PSM1000_ASSUMED_MAX * 100)
-        except (OSError, socket.error):
-            self.status = 'DISCONNECTED'
+        with self._io_lock:
+            try:
+                left = right = None
+                for msg in self._read_messages():
+                    parts = msg.split()
+                    if len(parts) < 4 or parts[0] != 'REPORT' or parts[1] != str(self.channel):
+                        continue
+                    try:
+                        value = int(parts[3])
+                    except ValueError:
+                        continue
+                    if parts[2] == 'AUDIO_IN_LVL_L':
+                        left = value
+                    elif parts[2] == 'AUDIO_IN_LVL_R':
+                        right = value
+                readings = [v for v in (left, right) if v is not None]
+                if readings:
+                    peak = min(max(readings), PSM1000_ASSUMED_MAX)
+                    self.metrics['audio'] = round(peak / PSM1000_ASSUMED_MAX * 100)
+            except (OSError, socket.error):
+                self.status = 'DISCONNECTED'
 
     def scan_rf(self):
         self.spectrum_data = []

@@ -9,6 +9,7 @@ import socket
 import ipaddress
 import sqlite3
 import hmac
+import asyncio
 import requests
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +17,14 @@ from tornado.ioloop import IOLoop
 from tornado.web import Application, RequestHandler
 from providers import ShureProvider, SennheiserProvider, UHFRProvider, PSM1000Provider
 import spectrum_planner
+
+# All blocking device I/O (poll, send_command, connect) runs here instead of
+# on the main IOLoop thread, so one slow/unresponsive device -- or a command
+# waiting on a hardware confirmation -- can't stall polling every other
+# device or serving any other HTTP request. Sized well above the device
+# count so polling everything in parallel plus the occasional command never
+# has to queue for a worker.
+DEVICE_EXECUTOR = ThreadPoolExecutor(max_workers=64)
 
 # --- CONFIGURATION ---
 CENTRAL_HUB_URL = "https://hub.omniwave.io/api/register" # Example Hub URL
@@ -152,23 +161,23 @@ class AnalyticsHandler(RequestHandler):
         self.write(json.dumps(data))
 
 class CommandHandler(RequestHandler):
-    def post(self):
+    async def post(self):
         params = json.loads(self.request.body)
         ip = params.get('ip')
         cmd = params.get('command')
         val = params.get('value')
         chan = params.get('channel', 1)
         if ip in Devices:
-            success = Devices[ip].send_command(cmd, val, chan)
+            success = await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, Devices[ip].send_command, cmd, val, chan)
             self.write(json.dumps({'success': success}))
         else: self.set_status(404)
 
 class ScanHandler(RequestHandler):
-    def get(self):
+    async def get(self):
         ip = self.get_argument('ip', None)
         if ip and ip in Devices:
             dev = Devices[ip]
-            dev.scan_rf()
+            await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.scan_rf)
             self.write(json.dumps({'spectrum': dev.spectrum_data}))
         else: self.set_status(404)
 
@@ -199,7 +208,7 @@ class StaticHandler(RequestHandler):
 class DeviceHandler(RequestHandler):
     """Add or remove a mic/wireless-system IP at runtime, persisted to
     config.json so it's still there on the next restart."""
-    def post(self):
+    async def post(self):
         params = json.loads(self.request.body)
         ip = params.get('ip')
         brand = params.get('brand', 'shure')
@@ -215,16 +224,16 @@ class DeviceHandler(RequestHandler):
             return
 
         dev = make_provider(ip, brand, dtype, channel)
-        dev.connect()
+        await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.connect)
         Devices[ip] = dev
         DeviceNames[ip] = name
         save_device_to_config(ip, brand, dtype, name, channel)
         self.write(json.dumps({'success': True, 'ip': ip, 'status': dev.status}))
 
-    def delete(self):
+    async def delete(self):
         ip = self.get_argument('ip', None)
         if ip and ip in Devices:
-            Devices[ip].disconnect()
+            await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, Devices[ip].disconnect)
             del Devices[ip]
             DeviceNames.pop(ip, None)
             DeviceFrequencies.pop(ip, None)
@@ -251,7 +260,7 @@ class FrequencyHandler(RequestHandler):
     """Assign a carrier frequency (MHz) to a device and, for a connected
     device, actually push it to the hardware (SET FREQUENCY) -- this is the
     real "Assign & Deploy" step, not just local bookkeeping."""
-    def post(self):
+    async def post(self):
         params = json.loads(self.request.body)
         ip = params.get('ip')
         freq = params.get('frequency_mhz')
@@ -272,7 +281,7 @@ class FrequencyHandler(RequestHandler):
 
         deployed = False
         if freq is not None and Devices[ip].status == 'CONNECTED':
-            deployed = Devices[ip].send_command('FREQUENCY', freq)
+            deployed = await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, Devices[ip].send_command, 'FREQUENCY', freq)
         self.write(json.dumps({'success': True, 'ip': ip, 'frequency_mhz': freq, 'deployed': deployed}))
 
 # Heuristic auto-discovery: probe the local /24 subnet for hosts with a
@@ -456,7 +465,7 @@ async def auto_discovery_tick():
                     continue
                 name = f.get('name') or f"{f['label']} ({ip})"
                 dev = make_provider(ip, f['brand'], f['type'], channel=1)
-                dev.connect()
+                await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.connect)
                 Devices[ip] = dev
                 DeviceNames[ip] = name
                 save_device_to_config(ip, f['brand'], f['type'], name, 1)
@@ -659,15 +668,26 @@ class ScanExclusionsHandler(RequestHandler):
 _last_webhook_sent = {}
 WEBHOOK_COOLDOWN_SECONDS = 60
 
-def poll_devices():
-    for ip, dev in Devices.items():
-        dev.poll()
+async def _poll_one_device(ip, dev):
+    try:
+        await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.poll)
         log_metrics(ip, dev.metrics)
         batt = dev.metrics.get('batt')
         if batt is not None and batt < 15 and time.time() - _last_webhook_sent.get(ip, 0) > WEBHOOK_COOLDOWN_SECONDS:
             send_webhook(f"CRITICAL LOW BATTERY: {ip} is at {batt}%")
             _last_webhook_sent[ip] = time.time()
-    IOLoop.current().call_later(1, poll_devices)
+    except Exception as e:
+        print(f"poll_devices: {ip} failed: {e}")
+
+async def poll_devices():
+    """Polls every device in parallel on DEVICE_EXECUTOR instead of one at
+    a time on the IOLoop thread -- with 16+ real devices each taking up to
+    ~0.4s of blocking socket I/O, sequential polling meant a full cycle
+    could take several seconds, during which the entire server (including
+    any command waiting on a hardware confirmation) was stalled."""
+    if Devices:
+        await asyncio.gather(*(_poll_one_device(ip, dev) for ip, dev in list(Devices.items())))
+    IOLoop.current().call_later(1, lambda: IOLoop.current().spawn_callback(poll_devices))
 
 def load_config():
     if not os.path.exists(CONFIG_PATH): return []
@@ -738,7 +758,7 @@ def main():
         if dev_cfg.get('frequency_mhz') is not None:
             DeviceFrequencies[ip] = dev_cfg['frequency_mhz']
 
-    poll_devices()
+    IOLoop.current().spawn_callback(poll_devices)
     IOLoop.current().spawn_callback(auto_discovery_tick)
     print(f"OmniWave OS v{VERSION} running on 0.0.0.0:9000...")
     IOLoop.current().start()
