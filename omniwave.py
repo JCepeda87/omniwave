@@ -10,12 +10,15 @@ import ipaddress
 import sqlite3
 import hmac
 import asyncio
+import mimetypes
 import requests
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from tornado.ioloop import IOLoop
 from tornado.web import Application, RequestHandler
-from providers import ShureProvider, SennheiserProvider, UHFRProvider, PSM1000Provider
+from providers import (ShureProvider, SennheiserProvider, UHFRProvider, PSM1000Provider,
+                       SLXDProvider, AxientDigitalProvider, MXWProvider, SennheiserSSCProvider,
+                       NoNetworkProvider)
 import spectrum_planner
 
 # All blocking device I/O (poll, send_command, connect) runs here instead of
@@ -30,14 +33,30 @@ DEVICE_EXECUTOR = ThreadPoolExecutor(max_workers=64)
 CENTRAL_HUB_URL = "https://hub.omniwave.io/api/register" # Example Hub URL
 VERSION = "2.1.0"
 INSTANCE_ID = os.getenv("OMNIWAVE_ID", "unregistered-instance")
-OTA_TOKEN = os.getenv("OMNIWAVE_OTA_TOKEN", "SUPER_SECRET_OTA_TOKEN")
+OTA_TOKEN = os.getenv("OMNIWAVE_OTA_TOKEN")  # no default: /system/update refuses to run without a real one
 CONFIG_PATH = 'config.json'
+PHOTO_DIR = os.path.join('static', 'photos')  # user-uploaded device photos, gitignored like config.json
 # ---------------------
 
 Devices = {}
-DeviceNames = {}  # ip -> user-assigned label, e.g. "Lead Vocal"
+DeviceNames = {}  # ip -> unit label (e.g. "VOX 1", "ULXD4Q-1") -- fixed at add time, not user-renamed
+DeviceAssignedUsers = {}  # ip -> name of the person currently using the device (User Board editable)
 DeviceFrequencies = {}  # ip -> assigned carrier frequency in MHz
+DeviceLayout = {}  # ip -> {'size': 'sm'|'md'|'lg', 'order': int} -- User Board card layout, admin-only
+CARD_SIZES = {'sm', 'md', 'lg'}
 DB_PATH = 'omniwave_history.db'
+
+# dtype tags matching the "type" picker in static/index.html's DEVICE_MODELS.
+# Models not listed here (ulxd/qlxd/uhf-r/psm1000/custom, and every
+# Sennheiser type not in the two sets below) keep routing to the original
+# generic providers -- either because that's already correct (ULX-D/QLX-D/
+# UHF-R/PSM1000 are hardware-verified), or because the model is ambiguous
+# (ew-g4 spans both networked and non-networked variants) or wasn't
+# researched deeply enough here to implement confidently (Digital 9000/6000,
+# Spectera, SpeechLine DW, 2000 Series).
+SHURE_NO_NETWORK_TYPES = {'glxd-plus', 'blx', 'psm900', 'psm300'}
+SENNHEISER_SSC_TYPES = {'ewdx', 'ewd', 'digital9000', 'digital6000', 'spectera'}
+SENNHEISER_NO_NETWORK_TYPES = {'xswd', 'xsw-iem', 'avx'}
 
 def make_provider(ip, brand, dtype, channel=1):
     if brand == 'shure':
@@ -45,7 +64,19 @@ def make_provider(ip, brand, dtype, channel=1):
             return UHFRProvider(ip, dtype, channel=channel)
         if dtype == 'psm1000':
             return PSM1000Provider(ip, dtype, channel=channel)
+        if dtype == 'slxd-plus':
+            return SLXDProvider(ip, dtype, channel=channel)
+        if dtype == 'axient-digital':
+            return AxientDigitalProvider(ip, dtype, channel=channel)
+        if dtype == 'mxw':
+            return MXWProvider(ip, dtype, channel=channel)
+        if dtype in SHURE_NO_NETWORK_TYPES:
+            return NoNetworkProvider(ip, dtype)
         return ShureProvider(ip, dtype, channel=channel)
+    if dtype in SENNHEISER_SSC_TYPES:
+        return SennheiserSSCProvider(ip, dtype, channel=channel)
+    if dtype in SENNHEISER_NO_NETWORK_TYPES:
+        return NoNetworkProvider(ip, dtype)
     return SennheiserProvider(ip, dtype)
 
 # Columns the metrics table must have. Add a new provider metric here (and it
@@ -108,6 +139,10 @@ class DataHandler(RequestHandler):
         for ip, dev in Devices.items():
             entry = dev.get_json()
             entry['name'] = DeviceNames.get(ip, '')
+            entry['assigned_user'] = DeviceAssignedUsers.get(ip, '')
+            layout = DeviceLayout.get(ip, {})
+            entry['card_size'] = layout.get('size', 'md')
+            entry['card_order'] = layout.get('order', 0)
             entry['brand'] = 'shure' if isinstance(dev, (ShureProvider, UHFRProvider, PSM1000Provider)) else 'sennheiser'
             # Prefer the live, hardware-reported frequency (real Shure gear
             # reports this every poll) over the locally-assigned one, so the
@@ -126,7 +161,7 @@ class UpdateHandler(RequestHandler):
     """
     def post(self):
         auth_token = self.get_argument('token', None)
-        if not auth_token or not hmac.compare_digest(auth_token, OTA_TOKEN):
+        if not OTA_TOKEN or not auth_token or not hmac.compare_digest(auth_token, OTA_TOKEN):
             self.set_status(403)
             return
 
@@ -193,15 +228,23 @@ class IndexHandler(RequestHandler):
         with open(os.path.join(os.path.abspath('.'), 'static', 'index.html'), 'rb') as f:
             self.write(f.read())
 
-class StaticHandler(RequestHandler):
+class UserIndexHandler(RequestHandler):
+    """The read-mostly, on-stage-facing view (battery/RF/name/photo per
+    device) -- as opposed to IndexHandler's full admin dashboard."""
     def get(self):
-        path = self.get_argument('path')
-        base_dir = os.path.abspath('.')
+        with open(os.path.join(os.path.abspath('.'), 'static', 'user.html'), 'rb') as f:
+            self.write(f.read())
+
+class StaticHandler(RequestHandler):
+    def get(self, path):
+        base_dir = os.path.abspath('static')
         full_path = os.path.abspath(os.path.join(base_dir, path))
         if not full_path.startswith(base_dir + os.sep):
             self.set_status(403); return
         if not os.path.isfile(full_path):
             self.set_status(404); return
+        content_type, _ = mimetypes.guess_type(full_path)
+        self.set_header('Content-Type', content_type or 'application/octet-stream')
         with open(full_path, 'rb') as f:
             self.write(f.read())
 
@@ -227,6 +270,7 @@ class DeviceHandler(RequestHandler):
         await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.connect)
         Devices[ip] = dev
         DeviceNames[ip] = name
+        DeviceLayout.setdefault(ip, {'size': 'md', 'order': len(Devices)})
         save_device_to_config(ip, brand, dtype, name, channel)
         self.write(json.dumps({'success': True, 'ip': ip, 'status': dev.status}))
 
@@ -236,15 +280,19 @@ class DeviceHandler(RequestHandler):
             await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, Devices[ip].disconnect)
             del Devices[ip]
             DeviceNames.pop(ip, None)
+            DeviceAssignedUsers.pop(ip, None)
             DeviceFrequencies.pop(ip, None)
+            DeviceLayout.pop(ip, None)
             remove_device_from_config(ip)
             self.write(json.dumps({'success': True}))
         else:
             self.set_status(404)
 
 class RenameHandler(RequestHandler):
-    """Relabel a device without touching its connection (e.g. "Lead Vocal"
-    instead of a raw IP), unlike DeviceHandler.post which reconnects."""
+    """Relabel a device's unit name without touching its connection, unlike
+    DeviceHandler.post which reconnects. Admin-only -- the User Board treats
+    the unit name as fixed and only lets people edit who's using it
+    (see AssignUserHandler)."""
     def post(self):
         params = json.loads(self.request.body)
         ip = params.get('ip')
@@ -255,6 +303,106 @@ class RenameHandler(RequestHandler):
         DeviceNames[ip] = name
         update_device_name_in_config(ip, name)
         self.write(json.dumps({'success': True, 'ip': ip, 'name': name}))
+
+class AssignUserHandler(RequestHandler):
+    """Sets who's currently using a device (shown over the photo on the User
+    Board) -- separate from the device's own unit name/label, which stays
+    fixed here."""
+    def post(self):
+        params = json.loads(self.request.body)
+        ip = params.get('ip')
+        assigned_user = (params.get('assigned_user') or '').strip()
+        if not ip or ip not in Devices:
+            self.set_status(404)
+            return
+        DeviceAssignedUsers[ip] = assigned_user
+        update_device_assigned_user_in_config(ip, assigned_user)
+        self.write(json.dumps({'success': True, 'ip': ip, 'assigned_user': assigned_user}))
+
+class CardSizeHandler(RequestHandler):
+    """Admin-only: sets a device's card size on the User Board (sm/md/lg)."""
+    def post(self):
+        params = json.loads(self.request.body)
+        ip = params.get('ip')
+        size = params.get('size')
+        if not ip or ip not in Devices:
+            self.set_status(404)
+            return
+        if size not in CARD_SIZES:
+            self.set_status(400)
+            self.write(json.dumps({'error': f'size must be one of {sorted(CARD_SIZES)}'}))
+            return
+        DeviceLayout.setdefault(ip, {})['size'] = size
+        update_device_card_size_in_config(ip, size)
+        self.write(json.dumps({'success': True, 'ip': ip, 'size': size}))
+
+class CardOrderHandler(RequestHandler):
+    """Admin-only: persists the full User Board card order after a
+    drag-and-drop reorder -- the client sends the complete ordered IP list
+    rather than a single move, which is simpler and more robust than
+    reconciling pairwise position swaps."""
+    def post(self):
+        params = json.loads(self.request.body)
+        order = params.get('order', [])
+        for idx, ip in enumerate(order):
+            if ip in Devices:
+                DeviceLayout.setdefault(ip, {})['order'] = idx
+                update_device_card_order_in_config(ip, idx)
+        self.write(json.dumps({'success': True}))
+
+PHOTO_EXTENSIONS = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif'}
+
+def _photo_filename(ip, ext):
+    return f"{ip.replace('.', '_')}{ext}"
+
+class PhotoHandler(RequestHandler):
+    """Attach/replace or remove the photo shown for a device on the user-facing
+    board (who's wearing this mic) -- stored on disk under PHOTO_DIR and
+    persisted to config.json like name/frequency so it survives a restart."""
+    def post(self):
+        ip = self.get_body_argument('ip', None)
+        if not ip or ip not in Devices:
+            self.set_status(404)
+            return
+        upload = self.request.files.get('photo')
+        if not upload:
+            self.set_status(400)
+            self.write(json.dumps({'error': 'photo file is required'}))
+            return
+        file_info = upload[0]
+        content_type = file_info.get('content_type', '')
+        ext = PHOTO_EXTENSIONS.get(content_type)
+        if not ext:
+            self.set_status(415)
+            self.write(json.dumps({'error': 'unsupported image type (use jpeg/png/webp/gif)'}))
+            return
+
+        os.makedirs(PHOTO_DIR, exist_ok=True)
+        for existing_ext in PHOTO_EXTENSIONS.values():
+            stale = os.path.join(PHOTO_DIR, _photo_filename(ip, existing_ext))
+            if os.path.isfile(stale):
+                os.remove(stale)
+        filename = _photo_filename(ip, ext)
+        with open(os.path.join(PHOTO_DIR, filename), 'wb') as f:
+            f.write(file_info['body'])
+
+        photo_url = f"/static/photos/{filename}"
+        Devices[ip].photo = photo_url
+        update_device_photo_in_config(ip, photo_url)
+        self.write(json.dumps({'success': True, 'ip': ip, 'photo': photo_url}))
+
+    def delete(self):
+        ip = self.get_argument('ip', None)
+        if not ip or ip not in Devices:
+            self.set_status(404)
+            return
+        for ext in PHOTO_EXTENSIONS.values():
+            stale = os.path.join(PHOTO_DIR, _photo_filename(ip, ext))
+            if os.path.isfile(stale):
+                os.remove(stale)
+        Devices[ip].photo = None
+        update_device_photo_in_config(ip, None)
+        self.write(json.dumps({'success': True, 'ip': ip}))
 
 class FrequencyHandler(RequestHandler):
     """Assign a carrier frequency (MHz) to a device and, for a connected
@@ -412,6 +560,12 @@ def identify_device(ip):
             return {'brand': 'shure', 'type': 'ulxd', 'label': 'ULX-D', 'name': raw or None}
         if 'QLXD' in text or raw.startswith('QLXD'):
             return {'brand': 'shure', 'type': 'qlxd', 'label': 'QLX-D', 'name': raw or None}
+        if 'SLXD' in text or raw.startswith('SLXD'):
+            return {'brand': 'shure', 'type': 'slxd-plus', 'label': 'SLX-D', 'name': raw or None}
+        if 'AD4' in text or 'ADX' in text or raw.startswith(('AD4', 'ADX')):
+            return {'brand': 'shure', 'type': 'axient-digital', 'label': 'Axient Digital', 'name': raw or None}
+        if 'MXWAPT' in text or raw.startswith('MXWAPT'):
+            return {'brand': 'shure', 'type': 'mxw', 'label': 'MXW (Microflex Wireless)', 'name': raw or None}
         if '<' in text and 'REP' in text:
             return {'brand': 'shure', 'type': 'custom', 'label': 'Shure (unidentified model)', 'name': raw or None}
     except OSError:
@@ -430,11 +584,49 @@ def identify_device(ip):
     except OSError:
         pass
 
+    # Sennheiser SSC (Sound Control Protocol): JSON over TCP port 45. A real
+    # GET for the device's model string, not just "is the port open" --
+    # https://docs.cloud.sennheiser.com/en-us/control-cockpit/control-cockpit/ssc-protocols.html
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(IDENTIFY_TIMEOUT)
+            s.connect((ip, 45))
+            s.sendall(b'{"device":{"identity":{"product":null}}}\r\n')
+            data = s.recv(4096)
+        text = data.decode('utf-8', errors='ignore').strip()
+        product = None
+        if text:
+            try:
+                parsed = json.loads(text.splitlines()[0])
+                device = parsed.get('device')
+                if isinstance(device, dict):
+                    product = device.get('identity', {}).get('product')
+            except (ValueError, AttributeError, IndexError):
+                product = None
+        if isinstance(product, str) and product.strip():
+            product = product.strip()
+            product_upper = product.upper()
+            if 'EW-DX' in product_upper:
+                dtype = 'ewdx'
+            elif 'EW-D' in product_upper:
+                dtype = 'ewd'
+            elif '9000' in product_upper:
+                dtype = 'digital9000'
+            elif '6000' in product_upper:
+                dtype = 'digital6000'
+            elif 'SPECTERA' in product_upper:
+                dtype = 'spectera'
+            else:
+                dtype = 'ewdx'
+            return {'brand': 'sennheiser', 'type': dtype, 'label': product, 'name': product}
+    except OSError:
+        pass
+
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(DISCOVERY_TIMEOUT)
             if s.connect_ex((ip, 45)) == 0:
-                return {'brand': 'sennheiser', 'type': 'ew-g4', 'label': 'Sennheiser (SSC port open)', 'name': None}
+                return {'brand': 'sennheiser', 'type': 'ew-g4', 'label': 'Sennheiser (SSC port open, model undetermined)', 'name': None}
     except OSError:
         pass
     return None
@@ -468,6 +660,7 @@ async def auto_discovery_tick():
                 await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.connect)
                 Devices[ip] = dev
                 DeviceNames[ip] = name
+                DeviceLayout.setdefault(ip, {'size': 'md', 'order': len(Devices)})
                 save_device_to_config(ip, f['brand'], f['type'], name, 1)
                 print(f"Auto-discovery: added {name} at {ip}")
         except Exception as e:
@@ -721,12 +914,41 @@ def update_device_frequency_in_config(ip, freq):
             d['frequency_mhz'] = freq
     save_config(devices)
 
+def update_device_assigned_user_in_config(ip, assigned_user):
+    devices = load_config()
+    for d in devices:
+        if d.get('ip') == ip:
+            d['assigned_user'] = assigned_user
+    save_config(devices)
+
+def update_device_card_size_in_config(ip, size):
+    devices = load_config()
+    for d in devices:
+        if d.get('ip') == ip:
+            d['card_size'] = size
+    save_config(devices)
+
+def update_device_card_order_in_config(ip, order):
+    devices = load_config()
+    for d in devices:
+        if d.get('ip') == ip:
+            d['card_order'] = order
+    save_config(devices)
+
+def update_device_photo_in_config(ip, photo_url):
+    devices = load_config()
+    for d in devices:
+        if d.get('ip') == ip:
+            d['photo'] = photo_url
+    save_config(devices)
+
 def main():
     init_db()
     register_installation()
     
     app = Application([
         (r'/', IndexHandler),
+        (r'/user', UserIndexHandler),
         (r'/data', DataHandler),
         (r'/analytics', AnalyticsHandler),
         (r'/command', CommandHandler),
@@ -735,6 +957,10 @@ def main():
         (r'/system/update', UpdateHandler),
         (r'/devices', DeviceHandler),
         (r'/devices/rename', RenameHandler),
+        (r'/devices/assign-user', AssignUserHandler),
+        (r'/devices/card-size', CardSizeHandler),
+        (r'/devices/card-order', CardOrderHandler),
+        (r'/devices/photo', PhotoHandler),
         (r'/devices/frequency', FrequencyHandler),
         (r'/discover', DiscoverHandler),
         (r'/discover/auto', AutoDiscoveryToggleHandler),
@@ -747,14 +973,20 @@ def main():
     ])
     app.listen(9000, address='0.0.0.0')
     device_list = load_config()
-    for dev_cfg in device_list:
+    for idx, dev_cfg in enumerate(device_list):
         ip = dev_cfg['ip']
         brand = dev_cfg.get('brand', 'shure')
         dtype = dev_cfg.get('type', 'axtd')
         channel = dev_cfg.get('channel', 1)
         Devices[ip] = make_provider(ip, brand, dtype, channel)
         Devices[ip].connect()
+        Devices[ip].photo = dev_cfg.get('photo')
         DeviceNames[ip] = dev_cfg.get('name', '')
+        DeviceAssignedUsers[ip] = dev_cfg.get('assigned_user', '')
+        DeviceLayout[ip] = {
+            'size': dev_cfg.get('card_size', 'md'),
+            'order': dev_cfg.get('card_order', idx),
+        }
         if dev_cfg.get('frequency_mhz') is not None:
             DeviceFrequencies[ip] = dev_cfg['frequency_mhz']
 

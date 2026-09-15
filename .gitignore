@@ -8,3 +8,5 @@ venv/
 config.json
 omniwave_history.db
 .claude/scheduled_tasks.lock
+static/photos/*
+!static/photos/.gitkeep

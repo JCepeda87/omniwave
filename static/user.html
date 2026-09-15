@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OmniWave — Board</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0c0e;
+    --panel: #16181c;
+    --panel-raised: #1c1f24;
+    --text: #f0f1f3;
+    --muted: #9aa0a8;
+    --border: #2a2e34;
+    --accent: #5b8def;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 20px;
+  }
+  .app-header {
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 12px; margin-bottom: 18px;
+  }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  .subtitle { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .header-right { display: flex; align-items: center; gap: 14px; }
+  .updated { color: var(--muted); font-size: 11px; }
+  .admin-link {
+    color: var(--muted); text-decoration: none; font-size: 12px;
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px;
+  }
+  .admin-link:hover { color: var(--text); border-color: var(--muted); }
+
+  .board { display: flex; flex-wrap: wrap; gap: 16px; }
+  .empty { color: var(--muted); font-size: 14px; padding: 40px; text-align: center; }
+
+  .ucard {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 auto;
+  }
+  /* Card size is set from the Admin UI only -- the User Board just renders it. */
+  .ucard.size-sm { width: 160px; }
+  .ucard.size-md { width: 230px; }
+  .ucard.size-lg { width: 320px; }
+  .uphoto {
+    position: relative;
+    aspect-ratio: 3 / 4;
+    background: var(--panel-raised) center/cover no-repeat;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .uphoto-placeholder { font-size: 40px; opacity: .35; }
+  .uphoto-upload {
+    position: absolute; bottom: 8px; right: 8px;
+    width: 30px; height: 30px; border-radius: 50%;
+    background: rgba(0,0,0,.55); backdrop-filter: blur(2px);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; cursor: pointer; border: 1px solid rgba(255,255,255,.15);
+  }
+  .uphoto-upload input { display: none; }
+
+  .uphoto-top {
+    position: absolute; top: 0; left: 0; right: 0;
+    padding: 10px 10px 20px;
+    background: linear-gradient(to bottom, rgba(0,0,0,.8), rgba(0,0,0,0));
+  }
+  .utop-row { display: flex; align-items: center; justify-content: space-between; }
+  .uchan-badge {
+    background: rgba(255,255,255,.14); color: var(--text);
+    font-size: 11px; font-weight: 700; border-radius: 5px; padding: 2px 7px;
+  }
+  .ustatus-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    box-shadow: 0 0 0 2px rgba(0,0,0,.4); flex-shrink: 0;
+  }
+  .ustatus-dot.CONNECTED { background: var(--ok); }
+  .ustatus-dot.DISCONNECTED { background: var(--bad); }
+
+  .uassigned-row { display: flex; align-items: center; gap: 4px; margin-top: 6px; }
+  .uassigned {
+    font-weight: 800; font-size: 17px; flex: 1; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; text-shadow: 0 1px 3px rgba(0,0,0,.6);
+  }
+  .uassigned.placeholder { color: rgba(255,255,255,.55); font-weight: 500; font-style: italic; }
+  .uedit-btn {
+    background: rgba(0,0,0,.4); border: none; color: rgba(255,255,255,.85); cursor: pointer;
+    font-size: 12px; padding: 3px 5px; border-radius: 5px; flex-shrink: 0;
+  }
+  .uedit-btn:hover { color: #fff; background: rgba(0,0,0,.6); }
+
+  .ubody { padding: 10px 12px 12px; }
+  .uunit-name { font-weight: 600; font-size: 13px; color: var(--text); }
+  .umeta { color: var(--muted); font-size: 11px; margin: 2px 0 8px; }
+
+  .umetric { display: flex; align-items: center; gap: 6px; font-size: 11px; margin-top: 5px; }
+  .umetric .uicon { width: 14px; text-align: center; flex-shrink: 0; }
+  .ubar { flex: 1; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  .ubar-fill { height: 100%; border-radius: 3px; background: var(--ok); transition: width .3s; }
+  .umetric.low .ubar-fill { background: var(--bad); }
+  .umetric.low .uval { color: var(--bad); }
+  .uval { width: 32px; text-align: right; flex-shrink: 0; font-weight: 600; }
+</style>
+</head>
+<body>
+  <div class="app-header">
+    <div>
+      <h1>OmniWave Board</h1>
+      <div class="subtitle">Live device status</div>
+    </div>
+    <div class="header-right">
+      <div class="updated" id="statUpdated">—</div>
+      <a class="admin-link" href="/">⚙ Admin</a>
+    </div>
+  </div>
+
+  <div class="board" id="board"></div>
+
+<script>
+let lastData = {};
+
+function isLow(key, val) {
+  if (val === undefined || val === null) return false;
+  if (key === 'batt') return val < 20;
+  if (key === 'rf') return val < 30;
+  return false;
+}
+
+function metricRow(icon, key, val, label) {
+  const pct = (val === undefined || val === null) ? 0 : Math.max(0, Math.min(100, val));
+  const low = isLow(key, val);
+  return `
+    <div class="umetric ${low ? 'low' : ''}" title="${label}">
+      <span class="uicon">${icon}</span>
+      <div class="ubar"><div class="ubar-fill" style="width:${pct}%"></div></div>
+      <span class="uval">${val !== undefined && val !== null ? val + '%' : '—'}</span>
+    </div>`;
+}
+
+async function assignUser(ip, currentUser) {
+  const next = prompt('Who is using this device?', currentUser || '');
+  if (next === null) return;
+  await fetch('/devices/assign-user', {
+    method: 'POST',
+    body: JSON.stringify({ ip, assigned_user: next.trim() }),
+  });
+  refresh();
+}
+
+async function uploadPhoto(ip, input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append('ip', ip);
+  form.append('photo', file);
+  try {
+    const res = await fetch('/devices/photo', { method: 'POST', body: form }).then(r => r.json());
+    if (res.error) alert(res.error);
+  } catch (e) {
+    alert('Photo upload failed.');
+  }
+  input.value = '';
+  refresh();
+}
+
+async function refresh() {
+  let data;
+  try {
+    data = await fetch('/data').then(r => r.json());
+  } catch (e) { return; }
+  lastData = data;
+  document.getElementById('statUpdated').textContent = new Date().toLocaleTimeString();
+
+  const boardEl = document.getElementById('board');
+  const ips = Object.keys(data).sort((a, b) => (data[a].card_order ?? 0) - (data[b].card_order ?? 0));
+  if (ips.length === 0) {
+    boardEl.innerHTML = '<div class="empty">No devices yet.</div>';
+    return;
+  }
+
+  boardEl.innerHTML = ips.map(ip => {
+    const d = data[ip];
+    const m = d.metrics || {};
+    const hasUser = d.assigned_user && d.assigned_user.trim().length > 0;
+    const displayUser = hasUser ? d.assigned_user : 'Unassigned';
+    const unitName = d.name || d.type || ip;
+    const cardSize = ['sm', 'md', 'lg'].includes(d.card_size) ? d.card_size : 'md';
+    const photoStyle = d.photo ? `style="background-image:url('${d.photo}')"` : '';
+    const placeholder = d.photo ? '' : '<div class="uphoto-placeholder">🎤</div>';
+    return `
+      <div class="ucard size-${cardSize}" data-ip="${ip}">
+        <div class="uphoto" ${photoStyle}>
+          ${placeholder}
+          <div class="uphoto-top">
+            <div class="utop-row">
+              <span class="uchan-badge">${d.channel ? 'CH ' + d.channel : (d.type || '')}</span>
+              <span class="ustatus-dot ${d.status}"></span>
+            </div>
+            <div class="uassigned-row">
+              <span class="uassigned ${hasUser ? '' : 'placeholder'}">${displayUser}</span>
+              <button class="uedit-btn" title="Set who's using this device" onclick="assignUser('${ip}', ${JSON.stringify(d.assigned_user || '')})">✎</button>
+            </div>
+          </div>
+          <label class="uphoto-upload" title="Add / change photo">
+            📷
+            <input type="file" accept="image/*" onchange="uploadPhoto('${ip}', this)">
+          </label>
+        </div>
+        <div class="ubody">
+          <div class="uunit-name">${unitName}</div>
+          <div class="umeta">${d.type || ''}${d.frequency_mhz != null ? ' · ' + d.frequency_mhz.toFixed(3) + ' MHz' : ''}</div>
+          ${metricRow('🔋', 'batt', m.batt, 'Battery')}
+          ${metricRow('📶', 'rf', m.rf, 'RF signal')}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -209,6 +209,25 @@
     padding: 8px; overflow-x: auto;
   }
   .spectrum-chart-wrap svg { display: block; width: 100%; height: 130px; }
+
+  .layout-board { display: flex; flex-wrap: wrap; gap: 10px; }
+  .layout-card {
+    width: 130px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 8px; cursor: grab; user-select: none;
+  }
+  .layout-card.dragging { opacity: .4; }
+  .layout-card.drag-over { border-color: var(--accent); }
+  .layout-thumb {
+    width: 100%; aspect-ratio: 3/4; border-radius: 6px; background: var(--panel-raised) center/cover no-repeat;
+    display: flex; align-items: center; justify-content: center; font-size: 22px; opacity: .8; margin-bottom: 6px;
+  }
+  .layout-label { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .layout-sub { font-size: 10px; color: var(--muted); margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .size-btns { display: flex; gap: 4px; }
+  .size-btns button {
+    flex: 1; padding: 4px 0; font-size: 11px; background: var(--border); color: var(--text);
+  }
+  .size-btns button.active { background: var(--accent); color: #fff; }
 </style>
 </head>
 <body>
@@ -222,6 +241,7 @@
       <div class="stat"><div class="stat-val" id="statConnected">0</div><div class="stat-label">Connected</div></div>
       <div class="stat" id="statAlertsCard"><div class="stat-val" id="statAlerts">0</div><div class="stat-label">Alerts</div></div>
       <div class="stat"><div class="stat-val" id="statUpdated">—</div><div class="stat-label">Updated</div></div>
+      <a href="/user" style="align-self:center; color:var(--muted); text-decoration:none; font-size:13px; border:1px solid var(--border); border-radius:8px; padding:8px 14px;">👤 User Board</a>
     </div>
   </div>
 
@@ -286,6 +306,18 @@
       </form>
       <div class="device-meta" id="importStatus" style="margin-top:8px"></div>
       <div id="importResults"></div>
+    </div>
+  </details>
+
+  <details class="panel" open>
+    <summary>User Board Layout</summary>
+    <div class="details-body">
+      <div class="device-meta" style="margin-bottom:10px">
+        Drag a card to reorder it, or pick S / M / L to resize it. This only controls how the
+        <a href="/user" target="_blank" style="color:var(--accent)">User Board</a> is laid out — sizing and
+        order aren't editable from there.
+      </div>
+      <div class="layout-board" id="layoutBoard"></div>
     </div>
   </details>
 
@@ -643,6 +675,84 @@ async function assignDeviceFrequency(ip, current) {
   refresh();
 }
 
+// --- User Board layout (size + order) --------------------------------------
+// Admin-only controls for the /user board's card sizes and arrangement;
+// the board itself just renders whatever card_size/card_order it's given.
+let dragIp = null;
+
+async function setCardSize(ip, size) {
+  await fetch('/devices/card-size', { method: 'POST', body: JSON.stringify({ ip, size }) });
+  refresh();
+}
+
+async function persistCardOrder() {
+  const order = [...document.querySelectorAll('.layout-card')].map(el => el.dataset.ip);
+  await fetch('/devices/card-order', { method: 'POST', body: JSON.stringify({ order }) });
+  refresh();
+}
+
+function layoutDragStart(e, ip) {
+  dragIp = ip;
+  e.currentTarget.classList.add('dragging');
+}
+function layoutDragEnd(e) {
+  e.currentTarget.classList.remove('dragging');
+}
+function layoutDragOver(e, ip) {
+  e.preventDefault();
+  if (ip !== dragIp) e.currentTarget.classList.add('drag-over');
+}
+function layoutDragLeave(e) {
+  e.currentTarget.classList.remove('drag-over');
+}
+function layoutDrop(e, targetIp) {
+  e.preventDefault();
+  e.currentTarget.classList.remove('drag-over');
+  if (!dragIp || dragIp === targetIp) return;
+  const board = document.getElementById('layoutBoard');
+  const dragEl = board.querySelector(`.layout-card[data-ip="${CSS.escape(dragIp)}"]`);
+  const targetEl = board.querySelector(`.layout-card[data-ip="${CSS.escape(targetIp)}"]`);
+  if (!dragEl || !targetEl) return;
+  const cards = [...board.children];
+  if (cards.indexOf(dragEl) < cards.indexOf(targetEl)) {
+    targetEl.after(dragEl);
+  } else {
+    targetEl.before(dragEl);
+  }
+  dragIp = null;
+  persistCardOrder();
+}
+
+function renderLayoutBoard(data) {
+  const el = document.getElementById('layoutBoard');
+  const ips = Object.keys(data).sort((a, b) => (data[a].card_order ?? 0) - (data[b].card_order ?? 0));
+  if (ips.length === 0) {
+    el.innerHTML = '<div class="empty">No devices yet.</div>';
+    return;
+  }
+  el.innerHTML = ips.map(ip => {
+    const d = data[ip];
+    const label = (d.assigned_user && d.assigned_user.trim()) || d.name || ip;
+    const size = ['sm', 'md', 'lg'].includes(d.card_size) ? d.card_size : 'md';
+    const thumbStyle = d.photo ? `style="background-image:url('${d.photo}')"` : '';
+    const thumbContent = d.photo ? '' : '🎤';
+    return `
+      <div class="layout-card" draggable="true" data-ip="${ip}"
+           ondragstart="layoutDragStart(event, '${ip}')" ondragend="layoutDragEnd(event)"
+           ondragover="layoutDragOver(event, '${ip}')" ondragleave="layoutDragLeave(event)"
+           ondrop="layoutDrop(event, '${ip}')">
+        <div class="layout-thumb" ${thumbStyle}>${thumbContent}</div>
+        <div class="layout-label">${label}</div>
+        <div class="layout-sub">${d.name || ip}</div>
+        <div class="size-btns">
+          <button class="${size === 'sm' ? 'active' : ''}" onclick="setCardSize('${ip}','sm')">S</button>
+          <button class="${size === 'md' ? 'active' : ''}" onclick="setCardSize('${ip}','md')">M</button>
+          <button class="${size === 'lg' ? 'active' : ''}" onclick="setCardSize('${ip}','lg')">L</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
 let lastData = {};
 
 async function refresh() {
@@ -657,6 +767,7 @@ async function refresh() {
   populateScanDeviceSelect();
   renderActiveFreqChips();
   renderSpectrumChart();
+  renderLayoutBoard(data);
 
   const ips = Object.keys(data);
   if (ips.length === 0) {
