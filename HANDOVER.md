@@ -2,28 +2,13 @@
 
 Last updated: 2026-10-02. Written for whoever picks this project up next.
 
-## Read this first: nothing is committed to git yet
+## Status: everything below is committed and pushed
 
-**This machine's `git` is broken**, and has been for the whole period this handover
-covers — `/usr/bin/git` (the only `git` installed) is gated behind an unaccepted Xcode
-license:
-
-```
-You have not agreed to the Xcode license agreements. Please run 'sudo xcodebuild -license'
-from within a Terminal window to review and agree to the Xcode and Apple SDKs license.
-```
-
-Every change described below is sitting **uncommitted in the working tree**. Before
-anything else:
-
-```bash
-sudo xcodebuild -license accept     # needs an interactive terminal + the Mac's password
-```
-
-`brew install git` also refuses to run until that's accepted (Homebrew's own installer
-hit the same error), so there's no way around it except accepting the license. Once that's
-done, review the working tree (`git status`, `git diff`) and commit in logical chunks —
-don't just `git add -A && git commit`; see "What changed" below for natural boundaries.
+Commits `d2d51a8`..`23f8580` on `main`, already on `origin` — a normal `git clone` or
+`git pull` gets you all of it. (For a while during this work, `git` itself was broken on
+the original dev machine — an unaccepted Xcode license was blocking `git`, `python3`, and
+`brew` all at once. That's resolved and was specific to that one Mac; see "Environment"
+below before assuming any of that applies to your own setup.)
 
 ## What this is
 
@@ -35,8 +20,27 @@ what's actually running under the hood and what's half-finished.
 
 ## Environment: how to actually run this
 
-This Mac has a messy Python situation — **read this before you spend an hour debugging
-"why won't it start."**
+**Normal setup, on a normal machine:**
+
+```bash
+git clone https://github.com/JCepeda87/omniwave.git
+cd omniwave
+python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+./venv/bin/python3 omniwave.py
+```
+
+Three small, pure-Python dependencies (`tornado`, `requests`, `netifaces`) — this should
+just work on any normal Python 3.8+ install with pip/network access. The rest of this
+section only applies if you hit the *exact* symptom below; otherwise skip it.
+
+---
+
+**What follows is specific to the original dev machine**, which had a broken Xcode
+Command Line Tools license that silently blocked `git`, `python3`, *and* `brew` all at
+once (`"You have not agreed to the Xcode license agreements..."`). If you ever see that
+exact error on a Mac, `sudo xcodebuild -license accept` (interactive terminal + password)
+fixes it at the root — cheaper than any of the workarounds below. Only if that's not an
+option did this project end up with:
 
 - `/usr/bin/python3` and the project's own `venv/bin/python3` (a symlink into
   `/Applications/Xcode.app/.../Python3.framework/...`) both route through the same
