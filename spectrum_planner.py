@@ -42,6 +42,25 @@ REGIONS = {
                   "much of Europe/UK; 470-606 MHz is interleaved spectrum requiring local "
                   "coordination. Rules vary by country -- verify with your national regulator."),
     },
+    'au_acma': {
+        'name': 'Australia (ACMA)',
+        'tv_channel_start': 28,
+        'tv_channel_end': 51,
+        'tv_channel_width_mhz': 7,
+        'tv_band_start_mhz': 526,
+        # ACMA permits wireless mics in 520-694 MHz following the 2015 "digital
+        # dividend" restack that cleared 694-820 MHz for mobile broadband:
+        # 520-526 MHz is available Australia-wide (sits below the first TV
+        # channel), and 526-694 MHz is the interleaved (unoccupied) UHF TV
+        # whitespace across channels 28-51 (7 MHz each, in blocks B-E).
+        'wireless_mic_ranges_mhz': [(520, 694)],
+        'notes': ("Wireless mics may use 520-694 MHz: the 520-526 MHz Australia-wide slice plus "
+                  "unoccupied (interleaved) UHF TV channels 28-51. 694-820 MHz can no longer be "
+                  "used (cleared for mobile in the 2015 restack). ACMA also permits license-exempt "
+                  "use in 915-928 MHz, 1790-1800 MHz, 2400-2483.5 MHz and 5725-5875 MHz, not modeled "
+                  "here since they're outside the TV band this tool coordinates against -- confirm "
+                  "local availability via ACMA's Channel Finder before deploying."),
+    },
 }
 
 IM_MARGIN_KHZ_DEFAULT = 250   # min. separation between a carrier and any 3rd-order IM product
