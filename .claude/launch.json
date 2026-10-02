@@ -3,9 +3,12 @@
   "configurations": [
     {
       "name": "omniwave",
-      "runtimeExecutable": "/opt/homebrew/bin/python3",
-      "runtimeArgs": ["/Users/julian.cepeda/Documents/Ominiwave/omniwave.py"],
-      "port": 9000
+      "runtimeExecutable": "/Users/zachary.beckenham/Documents/omniwave-main/venv/bin/python3",
+      "runtimeArgs": [
+        "/Users/zachary.beckenham/Documents/omniwave-main/omniwave.py"
+      ],
+      "port": 9000,
+      "cwd": "/Users/zachary.beckenham/Documents/omniwave-main"
     }
   ]
 }
