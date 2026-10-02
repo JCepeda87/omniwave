@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "omniwave",
-      "runtimeExecutable": "/usr/bin/python3",
+      "runtimeExecutable": "/opt/homebrew/bin/python3",
       "runtimeArgs": ["/Users/julian.cepeda/Documents/Ominiwave/omniwave.py"],
       "port": 9000
     }
