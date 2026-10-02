@@ -18,11 +18,15 @@ from collections import defaultdict
 #   metering, once enabled: < SAMPLE x ALL nn aaa eee > pushed periodically
 #     aaa = RF level 000-115 (subtract 128 for dBm); eee = audio level 000-050
 # "x" is the channel (1-4 on multi-channel receivers; 0 means "all channels").
+# METER_RATE is set to 250ms (Shure's documented floor is 100ms) on first
+# connect -- fast enough for the audio meter to read as live rather than
+# stepping once a second, without flooding the network at every device's
+# absolute minimum rate.
 
 # Confirming a SET needs a longer read window than a routine poll: a device
 # with metering already running (poll() enables it on first connect) is
-# also pushing an unsolicited SAMPLE roughly once a second, so there can be
-# real backlog to drain through before the actual confirmation shows up.
+# also pushing an unsolicited SAMPLE every 250ms, so there can be real
+# backlog to drain through before the actual confirmation shows up.
 CONFIRM_READ_TIMEOUT = 1.2
 
 # A dead network doesn't always fail loudly: an established TCP socket often
@@ -36,6 +40,42 @@ CONFIRM_READ_TIMEOUT = 1.2
 # silently repeating the last numbers it happened to have.
 NETWORK_MISS_LIMIT = 5
 
+# Published frequency-range-by-band charts. RF_BAND is a queryable hardware
+# parameter on SLX-D and Axient Digital (confirmed against Shure's own
+# command-string specs), so those providers query it live and look up the
+# actual MHz range below -- no guessing involved for those two lines.
+# ULX-D/QLX-D's spec was checked directly and does NOT include RF_BAND (it
+# was added to the command-string protocol later, for SLX-D/AD only), and
+# UHF-R's protocol wasn't confirmed to expose a band query either -- for
+# those, and for Sennheiser's mocked (non-SSC) line, there is no live way to
+# learn a specific unit's tunable range over the network, so this app can't
+# claim to know it; range enforcement for them instead relies on the
+# hardware's own explicit "REP ERR" rejection of an out-of-range SET (see
+# each provider's _apply_report handling of the 'ERR' parameter).
+# Sennheiser SSC devices (EW-DX/EW-D/etc.) are the most precise case: they
+# report their exact tunable range(s) directly via /device/frequency_ranges,
+# queried live in SennheiserSSCProvider -- no static table needed there.
+# Sources: manufacturer product-page frequency-range listings for each band,
+# cross-checked across multiple independent retailers (not the official PDF
+# band chart, whose bar-graph layout doesn't survive text extraction
+# reliably enough to trust for a safety check like this one).
+SLXD_BAND_RANGES = {
+    'G58': [(470.0, 514.0)],
+    'H55': [(514.0, 558.0)],
+    'J52': [(558.0, 602.0), (614.0, 616.0)],
+}
+AXIENT_DIGITAL_BAND_RANGES = {
+    'G57': [(470.0, 616.0)],
+}
+
+def freq_in_ranges(freq_mhz, ranges):
+    """True if freq_mhz falls in any (lo, hi) pair in ranges, or if ranges
+    is falsy (nothing known to enforce -- callers should treat that as
+    "can't verify" rather than "confirmed valid")."""
+    if not ranges:
+        return True
+    return any(lo <= freq_mhz <= hi for lo, hi in ranges)
+
 class BaseProvider(ABC):
     def __init__(self, ip, device_type, photo=None):
         self.ip = ip
@@ -45,6 +85,24 @@ class BaseProvider(ABC):
         self.metrics = {}
         self.spectrum_data = []
         self.alerts = []
+        # Populated (when the protocol supports it) by identifying the RF
+        # band/range live from the device itself -- see the module comment
+        # above. None means "unknown", not "unrestricted".
+        self.rf_band = None
+        self.rf_range_mhz = None
+        # Human-readable reason the last send_command('FREQUENCY', ...) call
+        # failed, e.g. because the hardware sent back a REP ERR. Read by
+        # FrequencyHandler right after a failed call; not persisted.
+        self.last_command_error = None
+        # 'receiver' (picks up RF from a body-worn mic/pack) or 'transmitter'
+        # (an IEM base station sending audio out to a body-worn receiver
+        # pack) -- set by omniwave.py's make_provider from the model type.
+        self.role = 'receiver'
+        # Set by a provider whose protocol structurally cannot report a
+        # frequency at all (e.g. PSM1000's one-way push protocol has no
+        # query channel) -- distinct from simply not having one assigned
+        # yet. None means a real frequency is knowable, just not present.
+        self.freq_unavailable_reason = None
         # Polling and a command can now run on different threads at once
         # (both go through omniwave.py's DEVICE_EXECUTOR); this serializes
         # any two operations against this *same* device's socket/buffer so
@@ -74,6 +132,11 @@ class BaseProvider(ABC):
             'alerts': self.alerts,
             'model': getattr(self, 'model', None),
             'channel': getattr(self, 'channel', 1),
+            'rf_band': self.rf_band,
+            'rf_range_mhz': self.rf_range_mhz,
+            'role': self.role,
+            'freq_unavailable_reason': self.freq_unavailable_reason,
+            'dante_status': getattr(self, 'dante_status', None),
         }
 
 class ShureProvider(BaseProvider):
@@ -86,6 +149,10 @@ class ShureProvider(BaseProvider):
         self._buffer = ''
         self._metering_started = False
         self._miss_count = 0
+        self._last_error = False
+        # See BaseProvider.get_json() -- None means "not yet queried",
+        # populated once at connect() below.
+        self.dante_status = None
 
     def connect(self):
         with self._io_lock:
@@ -97,8 +164,25 @@ class ShureProvider(BaseProvider):
                 self._metering_started = False
                 self._buffer = ''
                 self._miss_count = 0
+                self._query_dante_status()
             except Exception:
                 self.status = 'DISCONNECTED'
+
+    def _query_dante_status(self):
+        """NA_DEVICE_NAME is Shure's own confirmed command string --
+        documented as "Discovers the Dante device name on dual and quad
+        devices" -- the same query used earlier this session to confirm
+        live Dante hardware presence on a real ULXD4Q (it returned the
+        unit's actual Dante name). Device-scoped, not per-channel, so this
+        runs once at connect() rather than every poll cycle. A model
+        without Dante hardware isn't documented to return anything
+        specific here, so an empty/absent reply is treated as "no Dante"
+        rather than guessed at."""
+        try:
+            self._send('< GET NA_DEVICE_NAME >')
+            self._parse_messages(self._read_messages(timeout=0.5, stop_early=False))
+        except (OSError, socket.error):
+            pass
 
     def _mark_unreachable(self):
         self.status = 'DISCONNECTED'
@@ -165,11 +249,25 @@ class ShureProvider(BaseProvider):
                 parsed = int(value)
                 self.metrics['batt'] = None if parsed >= 252 else parsed
             except ValueError: pass
+        elif param == 'BATT_RUN_TIME':
+            # Minutes until the transmitter turns itself off -- confirmed in
+            # ULX-D's own spec. 65535 = off or using AA (non-rechargeable)
+            # batteries, where no runtime estimate is possible.
+            try:
+                parsed = int(value)
+                self.metrics['batt_minutes'] = None if parsed >= 65535 else parsed
+            except ValueError: pass
         elif param == 'FREQUENCY':
             try: self.metrics['frequency_mhz'] = int(value) / 1000
             except ValueError: pass
         elif param == 'MODEL':
             self.model = value.strip('{}').strip()
+        elif param == 'NA_DEVICE_NAME':
+            name = value.strip('{}').strip()
+            self.dante_status = {
+                'interface_present': bool(name), 'interfaces': None, 'auto': None,
+                'ip': None, 'device_name': name or None,
+            }
         elif param == 'AUDIO_MUTE':
             self.metrics['muted'] = (value == 'ON')
         elif param == 'RF_INT_DET' and value == 'CRITICAL':
@@ -177,6 +275,12 @@ class ShureProvider(BaseProvider):
             if not self.alerts or self.alerts[-1] != alert:
                 self.alerts.append(alert)
                 self.alerts = self.alerts[-20:]
+        elif param == 'ERR':
+            # The device's own explicit rejection of the last SET (e.g. a
+            # frequency outside its tunable range) -- confirmed for ULX-D:
+            # "REP ERR occurs when a command is improperly formatted or
+            # when the values are out of range."
+            self._last_error = True
 
     def _parse_messages(self, messages):
         for msg in messages:
@@ -212,9 +316,10 @@ class ShureProvider(BaseProvider):
         with self._io_lock:
             try:
                 if not self._metering_started:
-                    self._send(f'< SET {self.channel} METER_RATE 01000 >')
+                    self._send(f'< SET {self.channel} METER_RATE 00250 >')
                     self._metering_started = True
                 self._send(f'< GET {self.channel} BATT_CHARGE >')
+                self._send(f'< GET {self.channel} BATT_RUN_TIME >')
                 self._send(f'< GET {self.channel} FREQUENCY >')
                 messages = self._read_messages()
                 self._parse_messages(messages)
@@ -247,16 +352,22 @@ class ShureProvider(BaseProvider):
         before reporting success -- a successful socket write only means the
         bytes went out, not that the hardware actually applied the change."""
         if self.status != 'CONNECTED': return False
+        self.last_command_error = None
         with self._io_lock:
             try:
                 if cmd_type == 'MUTE':
+                    self._last_error = False
                     self._send(f'< SET {channel} AUDIO_MUTE {"ON" if value else "OFF"} >')
                     self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
                     return self.metrics.get('muted') == bool(value)
                 elif cmd_type == 'FREQUENCY':
+                    self._last_error = False
                     khz = int(round(float(value) * 1000))
                     self._send(f'< SET {channel} FREQUENCY {khz:06d} >')
                     self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
+                    if self._last_error:
+                        self.last_command_error = "Device rejected the frequency (REP ERR) -- likely outside this unit's tunable range."
+                        return False
                     return self.metrics.get('frequency_mhz') == round(khz / 1000, 4)
                 else:
                     self._send(f'< SET {channel} {cmd_type} {value} >')
@@ -472,6 +583,12 @@ class PSM1000Provider(BaseProvider):
         self.sock = None
         self._buffer = ''
         self._miss_count = 0
+        # Genuinely unknowable over this protocol, not just "not assigned
+        # yet": the P10T is a one-way push transmitter with no GET/SET
+        # channel at all (see the module comment above), so there's no way
+        # to ask it what frequency it's tuned to -- even though the real
+        # hardware obviously is tuned to one, since RF is actually flowing.
+        self.freq_unavailable_reason = "Not reported by this transmitter (one-way protocol, no query channel)"
 
     def connect(self):
         with self._io_lock:
@@ -576,6 +693,7 @@ class SLXDProvider(BaseProvider):
         self._buffer = ''
         self._metering_started = False
         self._miss_count = 0
+        self._last_error = False
 
     def connect(self):
         with self._io_lock:
@@ -587,8 +705,25 @@ class SLXDProvider(BaseProvider):
                 self._metering_started = False
                 self._buffer = ''
                 self._miss_count = 0
+                self._query_rf_band()
             except Exception:
                 self.status = 'DISCONNECTED'
+
+    def _query_rf_band(self):
+        """Real hardware discovery of this specific unit's RF band, so
+        FrequencyHandler can refuse a deploy outside its actual tunable
+        range instead of finding out only after the hardware rejects it."""
+        try:
+            self._send('< GET RF_BAND >')
+            for msg in self._read_messages(timeout=0.5, stop_early=False):
+                parts = msg.split()
+                if len(parts) >= 3 and parts[0] == 'REP' and parts[1] == 'RF_BAND':
+                    band = ' '.join(parts[2:]).strip('{}').strip()
+                    if band:
+                        self.rf_band = band
+                        self.rf_range_mhz = SLXD_BAND_RANGES.get(band)
+        except (OSError, socket.error):
+            pass
 
     def _mark_unreachable(self):
         self.status = 'DISCONNECTED'
@@ -637,11 +772,21 @@ class SLXDProvider(BaseProvider):
                 bars = int(value)
                 self.metrics['batt'] = None if bars >= 255 else min(100, bars * 20)
             except ValueError: pass
+        elif param == 'TX_BATT_MINS':
+            # Confirmed in SLX-D's own spec: 0-65532 = minutes of runtime;
+            # 65533 = battery comm warning, 65534 = still calculating,
+            # 65535 = unknown/not applicable. None covers all three.
+            try:
+                parsed = int(value)
+                self.metrics['batt_minutes'] = parsed if parsed <= 65532 else None
+            except ValueError: pass
         elif param == 'FREQUENCY':
             try: self.metrics['frequency_mhz'] = int(value) / 1000
             except ValueError: pass
         elif param == 'MODEL':
             self.model = value.strip('{}').strip()
+        elif param == 'ERR':
+            self._last_error = True
 
     def _parse_messages(self, messages):
         for msg in messages:
@@ -673,9 +818,10 @@ class SLXDProvider(BaseProvider):
         with self._io_lock:
             try:
                 if not self._metering_started:
-                    self._send(f'< SET {self.channel} METER_RATE 01000 >')
+                    self._send(f'< SET {self.channel} METER_RATE 00250 >')
                     self._metering_started = True
                 self._send(f'< GET {self.channel} TX_BATT_BARS >')
+                self._send(f'< GET {self.channel} TX_BATT_MINS >')
                 self._send(f'< GET {self.channel} FREQUENCY >')
                 messages = self._read_messages()
                 self._parse_messages(messages)
@@ -703,12 +849,17 @@ class SLXDProvider(BaseProvider):
         if cmd_type == 'MUTE':
             return False  # not supported: no mute parameter in SLX-D's command strings
         if self.status != 'CONNECTED': return False
+        self.last_command_error = None
         with self._io_lock:
             try:
                 if cmd_type == 'FREQUENCY':
+                    self._last_error = False
                     khz = int(round(float(value) * 1000))
                     self._send(f'< SET {channel} FREQUENCY {khz:06d} >')
                     self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
+                    if self._last_error:
+                        self.last_command_error = "Device rejected the frequency (REP ERR) -- likely outside this unit's tunable range."
+                        return False
                     return self.metrics.get('frequency_mhz') == round(khz / 1000, 4)
                 else:
                     self._send(f'< SET {channel} {cmd_type} {value} >')
@@ -738,6 +889,8 @@ class AxientDigitalProvider(BaseProvider):
         self._buffer = ''
         self._metering_started = False
         self._miss_count = 0
+        self._last_error = False
+        self.dante_status = None
 
     def connect(self):
         with self._io_lock:
@@ -749,8 +902,35 @@ class AxientDigitalProvider(BaseProvider):
                 self._metering_started = False
                 self._buffer = ''
                 self._miss_count = 0
+                self._query_rf_band()
+                self._query_dante_status()
             except Exception:
                 self.status = 'DISCONNECTED'
+
+    def _query_rf_band(self):
+        """Real hardware discovery of this specific unit's RF band, so
+        FrequencyHandler can refuse a deploy outside its actual tunable
+        range instead of finding out only after the hardware rejects it."""
+        try:
+            self._send('< GET RF_BAND >')
+            for msg in self._read_messages(timeout=0.5, stop_early=False):
+                parts = msg.split()
+                if len(parts) >= 3 and parts[0] == 'REP' and parts[1] == 'RF_BAND':
+                    band = ' '.join(parts[2:]).strip('{}').strip()
+                    if band:
+                        self.rf_band = band
+                        self.rf_range_mhz = AXIENT_DIGITAL_BAND_RANGES.get(band)
+        except (OSError, socket.error):
+            pass
+
+    def _query_dante_status(self):
+        """Axient Digital is Dante-native -- same confirmed NA_DEVICE_NAME
+        command string as ULX-D (see ShureProvider._query_dante_status)."""
+        try:
+            self._send('< GET NA_DEVICE_NAME >')
+            self._parse_messages(self._read_messages(timeout=0.5, stop_early=False))
+        except (OSError, socket.error):
+            pass
 
     def _mark_unreachable(self):
         self.status = 'DISCONNECTED'
@@ -799,13 +979,29 @@ class AxientDigitalProvider(BaseProvider):
                 parsed = int(value)
                 self.metrics['batt'] = None if parsed >= 255 else parsed
             except ValueError: pass
+        elif param == 'TX_BATT_MINS':
+            # Same encoding as SLX-D (confirmed in Axient Digital's own
+            # spec): 0-65532 = minutes of runtime; 65533-65535 = comm
+            # warning / still calculating / unknown, all covered by None.
+            try:
+                parsed = int(value)
+                self.metrics['batt_minutes'] = parsed if parsed <= 65532 else None
+            except ValueError: pass
         elif param == 'FREQUENCY':
             try: self.metrics['frequency_mhz'] = int(value) / 1000
             except ValueError: pass
         elif param == 'MODEL':
             self.model = value.strip('{}').strip()
+        elif param == 'NA_DEVICE_NAME':
+            name = value.strip('{}').strip()
+            self.dante_status = {
+                'interface_present': bool(name), 'interfaces': None, 'auto': None,
+                'ip': None, 'device_name': name or None,
+            }
         elif param == 'AUDIO_MUTE':
             self.metrics['muted'] = (value == 'ON')
+        elif param == 'ERR':
+            self._last_error = True
 
     def _parse_messages(self, messages):
         for msg in messages:
@@ -837,9 +1033,10 @@ class AxientDigitalProvider(BaseProvider):
         with self._io_lock:
             try:
                 if not self._metering_started:
-                    self._send(f'< SET {self.channel} METER_RATE 01000 >')
+                    self._send(f'< SET {self.channel} METER_RATE 00250 >')
                     self._metering_started = True
                 self._send(f'< GET {self.channel} TX_BATT_CHARGE_PERCENT >')
+                self._send(f'< GET {self.channel} TX_BATT_MINS >')
                 self._send(f'< GET {self.channel} FREQUENCY >')
                 messages = self._read_messages()
                 self._parse_messages(messages)
@@ -865,16 +1062,22 @@ class AxientDigitalProvider(BaseProvider):
 
     def send_command(self, cmd_type, value, channel=1):
         if self.status != 'CONNECTED': return False
+        self.last_command_error = None
         with self._io_lock:
             try:
                 if cmd_type == 'MUTE':
+                    self._last_error = False
                     self._send(f'< SET {channel} AUDIO_MUTE {"ON" if value else "OFF"} >')
                     self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
                     return self.metrics.get('muted') == bool(value)
                 elif cmd_type == 'FREQUENCY':
+                    self._last_error = False
                     khz = int(round(float(value) * 1000))
                     self._send(f'< SET {channel} FREQUENCY {khz:06d} >')
                     self._parse_messages(self._read_messages(timeout=CONFIRM_READ_TIMEOUT, stop_early=False))
+                    if self._last_error:
+                        self.last_command_error = "Device rejected the frequency (REP ERR) -- likely outside this unit's tunable range."
+                        return False
                     return self.metrics.get('frequency_mhz') == round(khz / 1000, 4)
                 else:
                     self._send(f'< SET {channel} {cmd_type} {value} >')
@@ -907,6 +1110,11 @@ class MXWProvider(BaseProvider):
         self._buffer = ''
         self._metering_started = False
         self._miss_count = 0
+        self._last_error = False
+        # Not a missing value -- there's no fixed carrier to report at all,
+        # since MXW hops automatically across the 2.4GHz band (no FREQUENCY
+        # command exists in its spec; see send_command below).
+        self.freq_unavailable_reason = "No fixed carrier -- this system hops automatically in the 2.4GHz band"
 
     def connect(self):
         with self._io_lock:
@@ -968,10 +1176,21 @@ class MXWProvider(BaseProvider):
                 parsed = int(value)
                 self.metrics['batt'] = None if parsed >= 255 else parsed
             except ValueError: pass
+        elif param == 'BATT_RUN_TIME':
+            # MXW's own sentinel scheme (different from SLX-D/AD4's):
+            # 0-65531 = minutes; 65532 = wall-wart powered (not draining);
+            # 65533 = on charger; 65534 = calculating; 65535 = off. Only
+            # the first case is a real countdown.
+            try:
+                parsed = int(value)
+                self.metrics['batt_minutes'] = parsed if parsed <= 65531 else None
+            except ValueError: pass
         elif param == 'TX_STATUS':
             self.metrics['muted'] = (value == 'MUTE')
         elif param == 'TX_TYPE':
             self.model = value.strip()
+        elif param == 'ERR':
+            self._last_error = True
 
     def _parse_messages(self, messages):
         for msg in messages:
@@ -1005,9 +1224,10 @@ class MXWProvider(BaseProvider):
         with self._io_lock:
             try:
                 if not self._metering_started:
-                    self._send(f'< SET {self.channel} METER_RATE 01000 >')
+                    self._send(f'< SET {self.channel} METER_RATE 00250 >')
                     self._metering_started = True
                 self._send(f'< GET {self.channel} BATT_CHARGE >')
+                self._send(f'< GET {self.channel} BATT_RUN_TIME >')
                 self._send(f'< GET {self.channel} TX_STATUS >')
                 messages = self._read_messages()
                 self._parse_messages(messages)
@@ -1056,6 +1276,7 @@ class NoNetworkProvider(BaseProvider):
     def connect(self):
         self.status = 'DISCONNECTED'
         self.alerts = ['No network control for this model -- monitor/control it directly on the hardware.']
+        self.freq_unavailable_reason = 'No network control for this model'
     def disconnect(self):
         self.status = 'DISCONNECTED'
     def poll(self):
@@ -1077,6 +1298,211 @@ class SennheiserProvider(BaseProvider):
         self.spectrum_data = [ (f, 40 + (i%15)) for i, f in enumerate(range(500, 600)) ]
     def send_command(self, cmd_type, value, channel=1):
         return True
+
+# Sennheiser ew G4 "Media control protocol" -- a completely different wire
+# protocol from SSC below: plain ASCII (not JSON), on a single UDP port used
+# for both sending and receiving, one attribute per bare-<CR>-terminated
+# line (no LF). This is what ew 300/500 G4 stationary receivers (EM) and IEM
+# transmitters (SR) actually speak -- NOT SSC/port 45, which only current
+# digital lines (EW-DX/EW-D/9000/6000/Spectera) use. Confirmed live against
+# a real EM unit; built from Sennheiser's own published spec (TI 1254 v1.0,
+# "Media control protocol description for ew G4"):
+#   Port 53212, ASCII, "Command param1 ... paramN<CR>" (single \r, no \n).
+#   Push <timeoutSec> <cyclicMs> <flags><CR> subscribes to periodic status:
+#     the device stops all cyclic/on-change pushes once timeoutSec elapses
+#     without a fresh Push, so this must be resent well before it expires.
+#     flags=3 here (send config-on-change + cyclic-on-warning-change).
+#     Single one-off commands (Name, Frequency, ...) work with no active
+#     subscription at all.
+#   Cyclic attributes pushed together each cycle -- for EM: RF1, RF2,
+#     States, RF, AF, Bat, Msg, Config. For SR: AF, States, Msg, Config.
+#     EM and SR share the exact same port/framing/Push mechanism but have
+#     different command sets (e.g. Squelch/AfOut only exist on EM,
+#     Sensitivity/Mode only on SR) -- used here to tell them apart for real
+#     (see identify_device()) instead of guessing from a model string.
+#   Bat (EM only) is a coarse 4-point scale -- 0/30/70/100%, or '?' meaning
+#     "no battery telegram received from the paired transmitter" -- not a
+#     continuous percentage like every Shure battery field in this app.
+G4_PORT = 53212
+G4_PUSH_TIMEOUT_SEC = 10
+G4_PUSH_CYCLIC_MS = 250
+
+class SennheiserG4Provider(BaseProvider):
+    def __init__(self, ip, device_type, photo=None, channel=1):
+        super().__init__(ip, device_type, photo)
+        # G4 stationary units are one channel per physical unit/IP -- no
+        # multi-channel model in this family (unlike ULXD4Q) -- channel is
+        # kept only so device_key()/get_json() stay consistent with every
+        # other provider.
+        self.channel = channel
+        self._is_em = (device_type == 'sennheiser-g4-em')
+        self.sock = None
+        self.model = None
+        self._buffer = ''
+        self._miss_count = 0
+        self._last_push_sent = 0
+        self._last_error = False
+
+    def connect(self):
+        with self._io_lock:
+            try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.sock.settimeout(0.5)
+                self.sock.connect((self.ip, G4_PORT))
+                self.status = 'CONNECTED'
+                self._buffer = ''
+                self._miss_count = 0
+                self._send(f'Push {G4_PUSH_TIMEOUT_SEC} {G4_PUSH_CYCLIC_MS} 3\r')
+                self._last_push_sent = time.time()
+                self._send('Name\r')
+                self._send('FirmwareRevision\r')
+                self._send('Frequency\r')
+                self._send('Mute\r')
+                for line in self._read_messages(timeout=0.5):
+                    self._apply_line(line)
+            except Exception:
+                self.status = 'DISCONNECTED'
+
+    def _mark_unreachable(self):
+        self.status = 'DISCONNECTED'
+        self.metrics = {}
+        self._miss_count = 0
+
+    def disconnect(self):
+        with self._io_lock:
+            if self.sock:
+                try: self.sock.close()
+                except Exception: pass
+            self.status = 'DISCONNECTED'
+
+    def _send(self, message):
+        self.sock.send(message.encode('ascii'))
+
+    def _read_messages(self, timeout=0.4):
+        """UDP datagrams queue in the kernel receive buffer between polls --
+        no persistent listener thread needed, same pattern PSM1000Provider
+        uses over TCP. Drains whatever has arrived since the last call; a
+        single datagram can carry several attributes (the device sends all
+        cyclic attributes "in one go"), each its own bare-<CR>-terminated line."""
+        deadline = time.time() + timeout
+        self.sock.settimeout(0.1)
+        got_any = False
+        while time.time() < deadline:
+            try:
+                chunk = self.sock.recv(4096)
+                if chunk:
+                    self._buffer += chunk.decode('ascii', errors='ignore')
+                    got_any = True
+            except socket.timeout:
+                if got_any:
+                    break
+            except OSError:
+                break
+        lines = [l.strip() for l in self._buffer.split('\r') if l.strip()]
+        self._buffer = ''
+        return lines
+
+    def _apply_line(self, line):
+        parts = line.split()
+        if not parts:
+            return
+        tag, vals = parts[0], parts[1:]
+        if tag.endswith(':') and tag[:-1].isdigit():
+            # Negative response to some prior command, e.g.
+            # "1020: Value out of range [ Frequency 56 2 9 ]" -- not a
+            # cyclic/config attribute, just note a command was rejected.
+            self._last_error = True
+        elif tag == 'Name' and vals:
+            self.model = ' '.join(vals)
+        elif tag == 'Frequency' and vals:
+            try: self.metrics['frequency_mhz'] = int(vals[0]) / 1000
+            except ValueError: pass
+        elif tag == 'Mute' and vals:
+            self.metrics['muted'] = vals[0] == '1'
+        elif tag == 'Bat' and vals:
+            # EM only -- coarse 4-point scale; '?' means the paired
+            # transmitter's battery telegram hasn't been received at all.
+            if vals[0] == '?':
+                self.metrics['batt'] = None
+            else:
+                try: self.metrics['batt'] = int(vals[0])
+                except ValueError: pass
+        elif tag == 'RF' and vals:
+            # EM only: current RF level in %, 100% = 40 dBuV.
+            try: self.metrics['rf'] = int(float(vals[0]))
+            except ValueError: pass
+        elif tag == 'AF' and vals:
+            # First value is always a live audio-level percentage on both EM
+            # (peak) and SR (RX-path-1 peak), which is all this app's single
+            # "audio" meter needs.
+            try: self.metrics['audio'] = int(float(vals[0]))
+            except ValueError: pass
+        elif tag == 'States' and vals:
+            if self._is_em:
+                # Mute flags bitfield since last cycle -- bit 0 means some
+                # kind of mute (TX/RF/RX) was active for the whole cycle.
+                try: self.metrics['muted'] = bool(int(vals[0]) & 0b1)
+                except ValueError: pass
+            else:
+                # SR: first value is the RF-Mute state right now (0=on air).
+                self.metrics['muted'] = vals[0] == '1'
+        elif tag == 'Msg':
+            warning = ' '.join(vals)
+            if warning and warning != 'OK':
+                for w in vals:
+                    label = w.replace('_', ' ')
+                    if not self.alerts or self.alerts[-1] != label:
+                        self.alerts.append(label)
+                self.alerts = self.alerts[-20:]
+
+    def poll(self):
+        if self.status != 'CONNECTED': return
+        with self._io_lock:
+            try:
+                now = time.time()
+                if now - self._last_push_sent > G4_PUSH_TIMEOUT_SEC / 2:
+                    self._send(f'Push {G4_PUSH_TIMEOUT_SEC} {G4_PUSH_CYCLIC_MS} 3\r')
+                    self._last_push_sent = now
+                lines = self._read_messages()
+                for line in lines:
+                    self._apply_line(line)
+                if not lines:
+                    self._miss_count += 1
+                    if self._miss_count >= NETWORK_MISS_LIMIT:
+                        self._mark_unreachable()
+                        return
+                else:
+                    self._miss_count = 0
+            except (OSError, socket.error):
+                self._mark_unreachable()
+
+    def scan_rf(self):
+        self.spectrum_data = []  # no spectrum sweep in this protocol
+
+    def send_command(self, cmd_type, value, channel=1):
+        if self.status != 'CONNECTED': return False
+        self.last_command_error = None
+        with self._io_lock:
+            try:
+                if cmd_type == 'MUTE':
+                    self._last_error = False
+                    self._send(f'Mute {1 if value else 0}\r')
+                    for line in self._read_messages(timeout=CONFIRM_READ_TIMEOUT):
+                        self._apply_line(line)
+                    return self.metrics.get('muted') == bool(value)
+                elif cmd_type == 'FREQUENCY':
+                    self._last_error = False
+                    khz = int(round(float(value) * 1000))
+                    self._send(f'Frequency {khz}\r')
+                    for line in self._read_messages(timeout=CONFIRM_READ_TIMEOUT):
+                        self._apply_line(line)
+                    if self._last_error:
+                        self.last_command_error = 'Rejected by device (value out of range for this unit)'
+                        return False
+                    return self.metrics.get('frequency_mhz') == round(khz / 1000, 4)
+            except (OSError, socket.error):
+                self._mark_unreachable()
+        return False
 
 # Sennheiser Sound Control Protocol (SSC / SSCv1) -- JSON-over-socket, used
 # by Sennheiser's current networked digital wireless lines (EW-DX, EW-D,
@@ -1117,8 +1543,15 @@ class SennheiserSSCProvider(BaseProvider):
         self.channel = channel
         self.sock = None
         self.model = None
-        self._buffer = ''
         self._miss_count = 0
+        # Populated on connect() -- confirmed real SSC addresses (not
+        # guessed): /device/network/ether/interfaces lists which physical
+        # interfaces the unit actually has ("CONTROL", and "DANTE" only on
+        # Dante-capable variants); ipv4_dante/{auto,ipaddr} is that
+        # interface's own network config, separate from the main control
+        # IP this provider is already connected to. None means "not yet
+        # queried" (e.g. device unreachable), not "confirmed absent".
+        self.dante_status = None
 
     def _rx(self):
         return f'rx{self.channel}'
@@ -1134,21 +1567,89 @@ class SennheiserSSCProvider(BaseProvider):
     def connect(self):
         with self._io_lock:
             try:
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.sock.settimeout(0.5)
+                # UDP/IP, not TCP: per Sennheiser's own SSC spec, EVERY
+                # networked SSC device "MUST implement the UDP/IP transport"
+                # -- TCP is an optional addition some product lines layer on
+                # top, not a given. Digital 6000 (EM 6000/L 6000) is
+                # documented as supporting ONLY UDP, confirmed against a
+                # real EM 6000 that never answered on TCP port 45 at all
+                # despite being alive on the network.
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.sock.settimeout(0.6)
                 self.sock.connect((self.ip, SSC_PORT))
-                self.status = 'CONNECTED'
-                self._buffer = ''
                 self._miss_count = 0
                 # Pull the real model string once, for display (identify_device()'s
-                # equivalent of ShureProvider's MODEL/DEVICE_ID parsing).
-                self._send({'device': {'identity': {'product': None}}})
-                for msg in self._read_messages(timeout=0.5, stop_early=False):
+                # equivalent of ShureProvider's MODEL/DEVICE_ID parsing), and this
+                # specific unit's actual tunable range(s) -- unlike Shure's RF_BAND
+                # (a code requiring a separate lookup table), SSC reports the exact
+                # numeric range(s) directly: no guessing needed for Sennheiser.
+                # This round-trip also doubles as the actual reachability check --
+                # UDP's connect() just records a default peer and never fails on
+                # its own, unlike TCP's, so "did we get any reply at all" is the
+                # only real signal that something is actually listening.
+                self._send({'device': {
+                    'identity': {'product': None},
+                    'frequency_ranges': None, 'frequency_code': None,
+                    'network': {'ether': {'interfaces': None}, 'ipv4_dante': {'auto': None, 'ipaddr': None}},
+                }})
+                replies = self._read_messages(timeout=0.6, stop_early=False)
+                if not replies:
+                    self.status = 'DISCONNECTED'
+                    return
+                self.status = 'CONNECTED'
+                interfaces = None
+                dante_auto = None
+                dante_ip = None
+                for msg in replies:
                     product = _ssc_extract(msg, 'device', 'identity', 'product')
                     if isinstance(product, str) and product.strip():
                         self.model = product.strip()
+                    code = _ssc_extract(msg, 'device', 'frequency_code')
+                    if isinstance(code, str) and code.strip():
+                        self.rf_band = code.strip()
+                    ranges = _ssc_extract(msg, 'device', 'frequency_ranges')
+                    if isinstance(ranges, list):
+                        parsed = self._parse_frequency_ranges(ranges)
+                        if parsed:
+                            self.rf_range_mhz = parsed
+                    ifaces = _ssc_extract(msg, 'device', 'network', 'ether', 'interfaces')
+                    if isinstance(ifaces, list):
+                        interfaces = ifaces
+                    auto = _ssc_extract(msg, 'device', 'network', 'ipv4_dante', 'auto')
+                    if isinstance(auto, bool):
+                        dante_auto = auto
+                    ip = _ssc_extract(msg, 'device', 'network', 'ipv4_dante', 'ipaddr')
+                    if isinstance(ip, str) and ip.strip():
+                        dante_ip = ip.strip()
+                # A device only reports the ipv4_dante branch at all if it
+                # actually has that interface -- "DANTE" in the interfaces
+                # list is the clean confirmation when present, but some
+                # firmware may answer the ipv4_dante query without echoing
+                # the interfaces list back in the same reply, so either
+                # signal on its own is enough to call the interface present.
+                dante_present = bool(interfaces and 'DANTE' in interfaces) or dante_ip is not None or dante_auto is not None
+                self.dante_status = {
+                    'interface_present': dante_present,
+                    'interfaces': interfaces,
+                    'auto': dante_auto,
+                    'ip': dante_ip,
+                }
             except Exception:
                 self.status = 'DISCONNECTED'
+
+    @staticmethod
+    def _parse_frequency_ranges(range_strings):
+        """Parses SSC's /device/frequency_ranges reply, a list of
+        "<start_hz>:<step_hz>:<end_hz>" strings, into (min_mhz, max_mhz)
+        tuples. e.g. ["470000000:25000:514875000"] -> [(470.0, 514.875)]."""
+        parsed = []
+        for entry in range_strings:
+            try:
+                start_hz, _step_hz, end_hz = entry.split(':')
+                parsed.append((round(int(start_hz) / 1e6, 4), round(int(end_hz) / 1e6, 4)))
+            except (ValueError, AttributeError):
+                continue
+        return parsed or None
 
     def disconnect(self):
         with self._io_lock:
@@ -1158,38 +1659,35 @@ class SennheiserSSCProvider(BaseProvider):
             self.status = 'DISCONNECTED'
 
     def _send(self, obj):
-        self.sock.sendall((json.dumps(obj) + '\r\n').encode('utf-8'))
+        # Per spec: "One UDP datagram is used to transport one SSC Message"
+        # -- no CRLF/LFLF framing needed (that convention exists only to
+        # find message boundaries in TCP's byte stream, which UDP doesn't have).
+        self.sock.send(json.dumps(obj).encode('utf-8'))
 
     def _read_messages(self, timeout=0.4, stop_early=True):
-        """Reads whatever arrives within `timeout` and splits the buffer on
-        SSC's line-based message separator (CRLF or LFLF -- splitting on any
-        bare '\\n' covers both, since valid SSC JSON can't contain one)."""
+        """Each UDP datagram IS exactly one complete SSC JSON message --
+        no stream reassembly needed, unlike TCP. Datagrams queue in the
+        kernel receive buffer between calls (same "no persistent listener
+        thread needed" pattern the other UDP-based providers in this file
+        use), so this just drains whatever's arrived since the last call."""
         deadline = time.time() + timeout
         self.sock.settimeout(0.1)
         got_any = False
+        messages = []
         while time.time() < deadline:
             try:
-                chunk = self.sock.recv(4096)
-                if not chunk:
-                    break
-                self._buffer += chunk.decode('utf-8', errors='ignore')
-                got_any = True
+                chunk = self.sock.recv(8192)
+                if chunk:
+                    got_any = True
+                    try:
+                        messages.append(json.loads(chunk.decode('utf-8', errors='ignore')))
+                    except ValueError:
+                        pass
             except socket.timeout:
                 if stop_early and got_any:
                     break
-        messages = []
-        while True:
-            idx = self._buffer.find('\n')
-            if idx == -1:
+            except OSError:
                 break
-            line = self._buffer[:idx].strip('\r\n ')
-            self._buffer = self._buffer[idx + 1:]
-            if not line:
-                continue
-            try:
-                messages.append(json.loads(line))
-            except ValueError:
-                continue
         return messages
 
     def _apply_message(self, msg):

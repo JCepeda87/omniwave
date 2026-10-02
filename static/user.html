@@ -52,6 +52,15 @@
     flex-direction: column;
     flex: 0 0 auto;
   }
+  /* A device with an active alert (low battery, RF interference, ...) gets
+     a visible red frame, similar to how WaveTool flags a problem channel --
+     the crew should be able to spot trouble across a wall of cards without
+     reading every one. */
+  .ucard.has-alert { border-color: var(--bad); box-shadow: 0 0 0 1px var(--bad); }
+  .ualert-banner {
+    background: var(--bad); color: #2a0a0a; font-size: 11px; font-weight: 700;
+    padding: 4px 10px; text-align: center;
+  }
   /* Card size is set from the Admin UI only -- the User Board just renders it. */
   .ucard.size-sm { width: 160px; }
   .ucard.size-md { width: 230px; }
@@ -77,11 +86,16 @@
     padding: 10px 10px 20px;
     background: linear-gradient(to bottom, rgba(0,0,0,.8), rgba(0,0,0,0));
   }
-  .utop-row { display: flex; align-items: center; justify-content: space-between; }
+  .utop-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
   .uchan-badge {
     background: rgba(255,255,255,.14); color: var(--text);
     font-size: 11px; font-weight: 700; border-radius: 5px; padding: 2px 7px;
   }
+  .urole-badge {
+    font-size: 10px; font-weight: 700; letter-spacing: .03em; border-radius: 5px; padding: 2px 6px;
+  }
+  .urole-badge.tx { background: rgba(251,191,36,.25); color: #fbbf24; }
+  .urole-badge.rx { background: rgba(91,141,239,.25); color: #7ea6f7; }
   .ustatus-dot {
     width: 10px; height: 10px; border-radius: 50%;
     box-shadow: 0 0 0 2px rgba(0,0,0,.4); flex-shrink: 0;
@@ -100,6 +114,11 @@
     font-size: 12px; padding: 3px 5px; border-radius: 5px; flex-shrink: 0;
   }
   .uedit-btn:hover { color: #fff; background: rgba(0,0,0,.6); }
+  .uassigned-input {
+    flex: 1; min-width: 0; font-size: 15px; font-weight: 700; padding: 3px 6px;
+    border-radius: 5px; border: 1px solid rgba(255,255,255,.3);
+    background: rgba(0,0,0,.55); color: #fff;
+  }
 
   .ubody { padding: 10px 12px 12px; }
   .uunit-name { font-weight: 600; font-size: 13px; color: var(--text); }
@@ -111,7 +130,7 @@
   .ubar-fill { height: 100%; border-radius: 3px; background: var(--ok); transition: width .3s; }
   .umetric.low .ubar-fill { background: var(--bad); }
   .umetric.low .uval { color: var(--bad); }
-  .uval { width: 32px; text-align: right; flex-shrink: 0; font-weight: 600; }
+  .uval { min-width: 32px; text-align: right; flex-shrink: 0; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -131,6 +150,17 @@
 <script>
 let lastData = {};
 
+// Inline editing instead of prompt() -- a native dialog is one accidental
+// "prevent this page from creating additional dialogs" click away from
+// silently no-op'ing forever, and some embedded/kiosk browsers don't
+// support prompt() at all. While active, refresh() skips rebuilding the
+// board so the 2s poll cycle can't wipe out an in-progress, unsaved edit.
+const editingUser = new Set();
+
+function escAttr(str) {
+  return String(str).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
 function isLow(key, val) {
   if (val === undefined || val === null) return false;
   if (key === 'batt') return val < 20;
@@ -138,23 +168,46 @@ function isLow(key, val) {
   return false;
 }
 
-function metricRow(icon, key, val, label) {
+function formatRuntime(mins) {
+  // "2h05m" instead of a bare percentage -- WaveTool's documented approach
+  // for receivers that report actual runtime, since "43 minutes left" is
+  // more actionable mid-show than "62%".
+  if (mins === undefined || mins === null) return null;
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return h > 0 ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m`;
+}
+
+function metricRow(icon, key, val, label, valueText) {
   const pct = (val === undefined || val === null) ? 0 : Math.max(0, Math.min(100, val));
   const low = isLow(key, val);
+  const text = valueText || (val !== undefined && val !== null ? val + '%' : '—');
   return `
     <div class="umetric ${low ? 'low' : ''}" title="${label}">
       <span class="uicon">${icon}</span>
       <div class="ubar"><div class="ubar-fill" style="width:${pct}%"></div></div>
-      <span class="uval">${val !== undefined && val !== null ? val + '%' : '—'}</span>
+      <span class="uval">${text}</span>
     </div>`;
 }
 
-async function assignUser(ip, currentUser) {
-  const next = prompt('Who is using this device?', currentUser || '');
-  if (next === null) return;
+function startUserEdit(ip) {
+  editingUser.add(ip);
+  renderBoard(lastData); // not refresh() -- that's guarded while editingUser is non-empty
+  setTimeout(() => {
+    const el = document.getElementById('userEdit-' + CSS.escape(ip));
+    if (el) { el.focus(); el.select(); }
+  }, 0);
+}
+
+function cancelUserEdit(ip) {
+  editingUser.delete(ip);
+  renderBoard(lastData);
+}
+
+async function saveUserEdit(ip, value) {
+  editingUser.delete(ip);
   await fetch('/devices/assign-user', {
     method: 'POST',
-    body: JSON.stringify({ ip, assigned_user: next.trim() }),
+    body: JSON.stringify({ ip, assigned_user: value.trim() }),
   });
   refresh();
 }
@@ -183,10 +236,26 @@ async function refresh() {
   lastData = data;
   document.getElementById('statUpdated').textContent = new Date().toLocaleTimeString();
 
+  // Skip rebuilding the board while a name edit is in progress -- the 2s
+  // poll cycle would otherwise wipe out unsaved keystrokes by replacing the
+  // whole board's innerHTML out from under the live input. startUserEdit/
+  // cancelUserEdit call renderBoard() directly instead, so opening/closing
+  // the editor itself always renders immediately regardless of this guard.
+  if (editingUser.size === 0) {
+    renderBoard(data);
+  }
+}
+
+function renderBoard(data) {
   const boardEl = document.getElementById('board');
-  const ips = Object.keys(data).sort((a, b) => (data[a].card_order ?? 0) - (data[b].card_order ?? 0));
+  // Only devices the admin has switched on for this board -- see the
+  // "User Board Layout" panel on the admin dashboard. Hidden ones still
+  // poll and stay fully controllable there; they just don't show up here.
+  const ips = Object.keys(data)
+    .filter(ip => data[ip].visible_on_board !== false)
+    .sort((a, b) => (data[a].card_order ?? 0) - (data[b].card_order ?? 0));
   if (ips.length === 0) {
-    boardEl.innerHTML = '<div class="empty">No devices yet.</div>';
+    boardEl.innerHTML = '<div class="empty">No devices selected for this board yet -- pick some from the admin dashboard\'s User Board Layout panel.</div>';
     return;
   }
 
@@ -199,19 +268,30 @@ async function refresh() {
     const cardSize = ['sm', 'md', 'lg'].includes(d.card_size) ? d.card_size : 'md';
     const photoStyle = d.photo ? `style="background-image:url('${d.photo}')"` : '';
     const placeholder = d.photo ? '' : '<div class="uphoto-placeholder">🎤</div>';
+    const assignedRow = editingUser.has(ip) ? `
+              <input type="text" class="uassigned-input" id="userEdit-${CSS.escape(ip)}" value="${escAttr(d.assigned_user || '')}"
+                onkeydown="if(event.key==='Enter'){saveUserEdit('${ip}', this.value);} else if(event.key==='Escape'){cancelUserEdit('${ip}');}">
+              <button class="uedit-btn" title="Save" onclick="saveUserEdit('${ip}', document.getElementById('userEdit-${CSS.escape(ip)}').value)">✓</button>
+              <button class="uedit-btn" title="Cancel" onclick="cancelUserEdit('${ip}')">✕</button>`
+      : `
+              <span class="uassigned ${hasUser ? '' : 'placeholder'}">${displayUser}</span>
+              <button class="uedit-btn" title="Set who's using this device" onclick="startUserEdit('${ip}')">✎</button>`;
+    const hasAlert = d.alerts && d.alerts.length > 0;
+    const alertBanner = hasAlert ? `<div class="ualert-banner">⚠ ${d.alerts[d.alerts.length - 1]}</div>` : '';
     return `
-      <div class="ucard size-${cardSize}" data-ip="${ip}">
+      <div class="ucard size-${cardSize} ${hasAlert ? 'has-alert' : ''}" data-ip="${ip}">
+        ${alertBanner}
         <div class="uphoto" ${photoStyle}>
           ${placeholder}
           <div class="uphoto-top">
             <div class="utop-row">
-              <span class="uchan-badge">${d.channel ? 'CH ' + d.channel : (d.type || '')}</span>
+              <div style="display:flex; align-items:center; gap:6px;">
+                <span class="uchan-badge">${d.channel ? 'CH ' + d.channel : (d.type || '')}</span>
+                <span class="urole-badge ${d.role === 'transmitter' ? 'tx' : 'rx'}" title="${d.role === 'transmitter' ? 'Transmitter (IEM beltpack feed)' : 'Receiver (picks up a body-worn mic)'}">${d.role === 'transmitter' ? 'TX' : 'RX'}</span>
+              </div>
               <span class="ustatus-dot ${d.status}"></span>
             </div>
-            <div class="uassigned-row">
-              <span class="uassigned ${hasUser ? '' : 'placeholder'}">${displayUser}</span>
-              <button class="uedit-btn" title="Set who's using this device" onclick="assignUser('${ip}', ${JSON.stringify(d.assigned_user || '')})">✎</button>
-            </div>
+            <div class="uassigned-row">${assignedRow}</div>
           </div>
           <label class="uphoto-upload" title="Add / change photo">
             📷
@@ -221,15 +301,18 @@ async function refresh() {
         <div class="ubody">
           <div class="uunit-name">${unitName}</div>
           <div class="umeta">${d.type || ''}${d.frequency_mhz != null ? ' · ' + d.frequency_mhz.toFixed(3) + ' MHz' : ''}</div>
-          ${metricRow('🔋', 'batt', m.batt, 'Battery')}
+          ${metricRow('🔋', 'batt', m.batt, 'Battery', formatRuntime(m.batt_minutes))}
           ${metricRow('📶', 'rf', m.rf, 'RF signal')}
+          ${metricRow('🔊', 'audio', m.audio, 'Audio')}
         </div>
       </div>`;
   }).join('');
 }
 
 refresh();
-setInterval(refresh, 2000);
+// Matches the backend's poll_devices() cadence (omniwave.py) so the audio
+// meter reads as live rather than visibly stepping.
+setInterval(refresh, 500);
 </script>
 </body>
 </html>

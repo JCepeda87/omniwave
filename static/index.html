@@ -148,6 +148,21 @@
   .device-name-row { display: flex; align-items: center; gap: 4px; }
   .device-name { font-weight: 600; font-size: 14px; }
   .device-ip { color: var(--muted); font-size: 11px; }
+  .role-badge {
+    font-size: 9px; font-weight: 700; letter-spacing: .03em; border-radius: 4px;
+    padding: 2px 5px; flex-shrink: 0; margin-left: auto;
+  }
+  .role-badge.rx { background: var(--accent-dim); color: var(--accent); }
+  .role-badge.tx { background: var(--warn-dim); color: var(--warn); }
+  .dante-badge {
+    font-size: 9px; font-weight: 700; letter-spacing: .03em; border-radius: 4px;
+    padding: 2px 5px; flex-shrink: 0;
+  }
+  .dante-badge.on { background: var(--accent-dim); color: var(--accent); }
+  .dante-badge.off { background: rgba(128,128,128,0.2); color: var(--muted); }
+  .inline-edit-input {
+    flex: 1; min-width: 0; padding: 3px 6px; font-size: 13px;
+  }
 
   .status-line { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; }
   .status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
@@ -172,7 +187,17 @@
 
   .alerts { font-size: 12px; color: var(--warn); margin: 6px 0; }
   .device-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .device-filter-row { margin-bottom: 10px; font-size: 13px; color: var(--muted); }
+  .device-filter-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
   .empty { color: var(--muted); font-size: 13px; padding: 20px; text-align: center; }
+
+  .stream-config-form {
+    margin-top: 10px; padding: 10px; background: var(--bg); border-radius: 8px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .stream-config-fields { display: flex; gap: 6px; flex-wrap: wrap; }
+  .stream-config-fields input, .stream-config-fields select { flex: 1; min-width: 80px; }
+  .stream-config-actions { display: flex; gap: 6px; }
 
   .spectrum {
     display: flex; align-items: flex-end; gap: 1px; height: 40px;
@@ -203,7 +228,7 @@
     padding: 4px 10px; font-size: 12px; display: inline-flex; align-items: center; gap: 4px;
   }
   .chip-remove { background: none; border: none; color: inherit; padding: 0; font-size: 13px; cursor: pointer; }
-  .device-freq-row { display: flex; align-items: center; gap: 4px; }
+  .device-freq-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
   .spectrum-chart-wrap {
     background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
     padding: 8px; overflow-x: auto;
@@ -217,6 +242,8 @@
   }
   .layout-card.dragging { opacity: .4; }
   .layout-card.drag-over { border-color: var(--accent); }
+  .layout-card-hidden { opacity: .45; }
+  .layout-card-hidden .layout-thumb { filter: grayscale(1); }
   .layout-thumb {
     width: 100%; aspect-ratio: 3/4; border-radius: 6px; background: var(--panel-raised) center/cover no-repeat;
     display: flex; align-items: center; justify-content: center; font-size: 22px; opacity: .8; margin-bottom: 6px;
@@ -228,6 +255,11 @@
     flex: 1; padding: 4px 0; font-size: 11px; background: var(--border); color: var(--text);
   }
   .size-btns button.active { background: var(--accent); color: #fff; }
+  .visibility-btn {
+    width: 100%; margin-top: 4px; padding: 4px 0; font-size: 11px;
+    background: var(--ok-dim); color: var(--ok);
+  }
+  .visibility-btn.off { background: var(--border); color: var(--muted); }
 </style>
 </head>
 <body>
@@ -265,13 +297,12 @@
         </select>
         <select name="type" id="typeSelect"></select>
         <input name="typeCustom" id="typeCustom" placeholder="model name" style="display:none">
-        <input type="number" name="channel" min="1" max="8" value="1" title="Channel (for multi-channel receivers, e.g. 1 or 2 on a dual)" style="width:56px">
         <button type="submit">Add device</button>
       </form>
       <div class="device-meta" style="margin-top:6px">
-        Channel picks which channel to monitor on a multi-channel receiver (e.g. a dual UR4D or quad ULXD4Q).
-        Each IP is currently tracked as one device, so re-adding the same IP with a different channel replaces
-        this entry rather than adding a second one alongside it.
+        Multi-channel receivers (a dual UR4D, quad ULXD4Q, dual PSM1000 P10T, ...) are detected automatically --
+        this queries the unit for its real channel count and adds each channel as its own device, rather than
+        tracking only one channel per IP. Re-adding an IP re-discovers and reconnects every channel it has.
       </div>
 
       <h2 style="margin-top:20px">Auto Discovery</h2>
@@ -285,6 +316,18 @@
         <span class="device-meta" id="scanStatus"></span>
       </div>
       <div class="discovery-results" id="discoveryResults"></div>
+
+      <div class="device-meta" style="margin-top:14px">
+        Scan Network only covers this computer's currently-detected local subnets (and caps a large one down
+        to its own /24). The venue's network isn't always that one -- a unit can be on a different segment
+        than this laptop, or plugged in directly on its own isolated link. If you can read an IP off the
+        device itself (its display, a network menu, a label), probe it directly instead:
+      </div>
+      <div class="discovery-controls">
+        <input id="probeIpInput" placeholder="e.g. 169.254.224.109" style="flex:1" onkeydown="if(event.key==='Enter')probeIp()">
+        <button id="probeBtn" class="secondary" onclick="probeIp()">Probe IP</button>
+      </div>
+      <div class="discovery-results" id="probeResult"></div>
 
       <div class="coord-row" style="margin-top:14px; gap:10px">
         <button id="autoDiscoveryToggle" class="secondary" onclick="toggleAutoDiscovery()">Enable Auto-Add</button>
@@ -313,9 +356,10 @@
     <summary>User Board Layout</summary>
     <div class="details-body">
       <div class="device-meta" style="margin-bottom:10px">
-        Drag a card to reorder it, or pick S / M / L to resize it. This only controls how the
-        <a href="/user" target="_blank" style="color:var(--accent)">User Board</a> is laid out — sizing and
-        order aren't editable from there.
+        Drag a card to reorder it, pick S / M / L to resize it, or click 👁/🚫 to choose which devices actually
+        show up on the <a href="/user" target="_blank" style="color:var(--accent)">User Board</a> — a hidden
+        device stays fully connected and controllable here, it just won't appear there. None of this is
+        editable from the User Board itself.
       </div>
       <div class="layout-board" id="layoutBoard"></div>
     </div>
@@ -395,11 +439,13 @@
         <button class="secondary" onclick="suggestFrequencies()">Suggest Frequencies</button>
       </div>
       <div class="device-meta" style="margin:10px 0">
-        Or, like WWB's own Calculate + Assign &amp; Deploy: recompute clean frequencies for every 🔓 unlocked
-        device below at once (🔒 locked devices keep their frequency and anchor the calculation).
+        Like WWB's own Calculate + Assign &amp; Deploy, but split in two: recompute clean frequencies for every
+        🔓 unlocked device below (🔒 locked devices keep their frequency and anchor the calculation), review
+        them, then push to hardware only when you're ready.
       </div>
       <div class="device-actions">
-        <button onclick="calculateAllAndDeploy()">Calculate All &amp; Deploy</button>
+        <button onclick="calculateAll()">Calculate All</button>
+        <button id="deployCalculatedBtn" class="secondary" onclick="deployCalculated()" disabled>Deploy</button>
       </div>
 
       <div id="coordResults" style="margin-top:14px"></div>
@@ -408,6 +454,9 @@
 
   <div class="panel">
     <h2>Devices</h2>
+    <div class="device-filter-row">
+      <label><input type="checkbox" id="danteOnlyToggle" onchange="toggleDanteFilter(this.checked)"> Show Dante-confirmed devices only</label>
+    </div>
     <div class="devices" id="devices">
       <div class="empty">No devices yet — add one above.</div>
     </div>
@@ -420,6 +469,35 @@ const liveScans = {}; // ip -> interval id, only present while live-scanning
 const historyVisible = {};
 const historyCache = {};
 const LIVE_SCAN_INTERVAL_MS = 1500;
+
+// Real-time AES67 "listen" -- ip -> {ws, ctx, nextTime, channels} while a
+// listen session is open, and ip -> true while its config form is open.
+const listenSockets = {};
+const streamConfigOpen = new Set();
+let sapStreamsCache = {};
+
+// When on, narrows the device grid to units whose Dante interface has been
+// live-confirmed present (see dante_status -- queried via each device's own
+// control protocol, not guessed) -- useful for jumping straight to the
+// devices AES67 "Listen" can actually reach real audio from.
+let danteOnlyFilter = false;
+function toggleDanteFilter(checked) {
+  danteOnlyFilter = checked;
+  renderDevices(lastData);
+}
+
+// Inline editing (name/frequency) uses a real input instead of prompt() --
+// a native dialog is one accidental "prevent this page from creating
+// additional dialogs" click away from silently no-op'ing forever, and some
+// embedded/kiosk browsers don't support prompt() at all. While either is
+// active, refresh() skips rebuilding the device grid so the 2s poll cycle
+// can't wipe out an in-progress, unsaved edit.
+const editingName = new Set();
+const editingFreq = new Set();
+
+function escAttr(str) {
+  return String(str).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
 
 // Curated pool of current wireless mic/IEM systems per brand, for the
 // "type" picker when adding a device. value = short type tag stored in
@@ -476,9 +554,10 @@ brandSelect.addEventListener('change', populateModelOptions);
 typeSelect.addEventListener('change', updateCustomVisibility);
 populateModelOptions();
 
-function modelOptionsHtml(brand) {
+function modelOptionsHtml(brand, selectedType) {
   const models = DEVICE_MODELS[brand] || DEVICE_MODELS.shure;
-  return models.map(([value, label]) => `<option value="${value}">${label}</option>`).join('');
+  return models.map(([value, label]) =>
+    `<option value="${value}" ${value === selectedType ? 'selected' : ''}>${label}</option>`).join('');
 }
 
 async function scanNetwork() {
@@ -494,17 +573,23 @@ async function scanNetwork() {
     if (!candidates.length) {
       resultsEl.innerHTML = '<div class="empty">No candidates found on the local network.</div>';
     } else {
+      // Each candidate was actually queried over its real protocol
+      // (identify_device() on the backend), not guessed from which port
+      // happened to respond -- c.identified tells the two cases apart.
       resultsEl.innerHTML = candidates.map((c, i) => `
         <div class="discovery-row">
           <div>
-            <div class="device-name">${c.ip}</div>
-            <div class="device-meta">${c.brand} · port ${c.port} open</div>
+            <div class="device-name">${c.ip} — ${c.label || c.brand}</div>
+            <div class="device-meta" ${c.identified ? '' : 'style="color:var(--warn)"'}>
+              ${c.identified ? (c.name ? `Identified as ${c.name}` : 'Identified, no name reported') : "Couldn't confirm model — pick one manually below"}
+            </div>
           </div>
-          <select id="discModel-${i}">${modelOptionsHtml(c.brand)}</select>
+          <select id="discModel-${i}">${modelOptionsHtml(c.brand, c.type)}</select>
           <button onclick="addDiscovered('${c.ip}', '${c.brand}', ${i})">Add</button>
         </div>`).join('');
     }
-    status.textContent = `Found ${candidates.length} candidate(s).`;
+    const identifiedCount = candidates.filter(c => c.identified).length;
+    status.textContent = `Found ${candidates.length} candidate(s), ${identifiedCount} identified.`;
   } catch (e) {
     status.textContent = 'Scan failed.';
   } finally {
@@ -521,6 +606,55 @@ async function addDiscovered(ip, brand, idx) {
   });
   refresh();
   scanNetwork();
+}
+
+async function probeIp() {
+  const input = document.getElementById('probeIpInput');
+  const btn = document.getElementById('probeBtn');
+  const resultsEl = document.getElementById('probeResult');
+  const ip = input.value.trim();
+  if (!ip) return;
+  btn.disabled = true;
+  resultsEl.innerHTML = '<div class="device-meta">Probing...</div>';
+  try {
+    // Unlike /discover, this checks exactly this one address directly --
+    // it isn't limited to subnets this computer happens to have detected.
+    const c = await fetch('/discover/probe', {
+      method: 'POST',
+      body: JSON.stringify({ ip }),
+    }).then(r => r.json());
+    if (c.already_added) {
+      resultsEl.innerHTML = `<div class="device-meta">${ip} is already added.</div>`;
+    } else if (!c.identified) {
+      resultsEl.innerHTML = `<div class="empty">${c.error || 'No response from this address.'}</div>`;
+    } else {
+      resultsEl.innerHTML = `
+        <div class="discovery-row">
+          <div>
+            <div class="device-name">${c.ip} — ${c.label || c.brand}</div>
+            <div class="device-meta">${c.name ? `Identified as ${c.name}` : 'Identified, no name reported'}</div>
+          </div>
+          <select id="probeModel">${modelOptionsHtml(c.brand, c.type)}</select>
+          <button onclick="addProbed('${c.ip}', '${c.brand}')">Add</button>
+        </div>`;
+    }
+  } catch (e) {
+    resultsEl.innerHTML = '<div class="empty">Probe failed.</div>';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function addProbed(ip, brand) {
+  const select = document.getElementById('probeModel');
+  const type = select ? select.value : 'custom';
+  await fetch('/devices', {
+    method: 'POST',
+    body: JSON.stringify({ ip, brand, type }),
+  });
+  refresh();
+  document.getElementById('probeResult').innerHTML = '';
+  document.getElementById('probeIpInput').value = '';
 }
 
 async function loadAutoDiscoveryState() {
@@ -649,31 +783,92 @@ function renderStats(data) {
   document.getElementById('statUpdated').textContent = new Date().toLocaleTimeString();
 }
 
-async function renameDevice(ip, currentName) {
-  const next = prompt('Device label', currentName || '');
-  if (next === null) return;
+function startNameEdit(ip) {
+  editingName.add(ip);
+  renderDevices(lastData); // not refresh() -- that's guarded while editingName is non-empty
+  setTimeout(() => {
+    const el = document.getElementById('nameEdit-' + CSS.escape(ip));
+    if (el) { el.focus(); el.select(); }
+  }, 0);
+}
+
+function cancelNameEdit(ip) {
+  editingName.delete(ip);
+  renderDevices(lastData);
+}
+
+async function saveNameEdit(ip, value) {
+  editingName.delete(ip);
   await fetch('/devices/rename', {
     method: 'POST',
-    body: JSON.stringify({ ip, name: next.trim() }),
+    body: JSON.stringify({ ip, name: value.trim() }),
   });
   refresh();
 }
 
-async function assignDeviceFrequency(ip, current) {
-  const input = prompt('Carrier frequency (MHz) — leave blank to clear', current != null ? String(current) : '');
-  if (input === null) return;
-  const trimmed = input.trim();
+function startFreqEdit(ip) {
+  editingFreq.add(ip);
+  renderDevices(lastData); // not refresh() -- that's guarded while editingFreq is non-empty
+  setTimeout(() => {
+    const el = document.getElementById('freqEdit-' + CSS.escape(ip));
+    if (el) { el.focus(); el.select(); }
+  }, 0);
+}
+
+function cancelFreqEdit(ip) {
+  editingFreq.delete(ip);
+  renderDevices(lastData);
+}
+
+function showFreqEditError(ip, msg) {
+  // Sets an inline error next to the still-open input, without re-rendering
+  // the card (which would reset the input to the last-saved value and
+  // discard whatever the operator just typed).
+  const input = document.getElementById('freqEdit-' + CSS.escape(ip));
+  if (!input) return;
+  input.title = msg;
+  input.style.borderColor = 'var(--bad)';
+  const row = input.closest('.device-freq-row');
+  if (!row) return;
+  let errEl = row.querySelector('.inline-edit-error');
+  if (!errEl) {
+    errEl = document.createElement('div');
+    errEl.className = 'inline-edit-error device-meta';
+    errEl.style.cssText = 'width:100%; color:var(--bad)';
+    row.appendChild(errEl);
+  }
+  errEl.textContent = msg;
+}
+
+async function saveFreqEdit(ip, value) {
+  const trimmed = value.trim();
   const freq = trimmed === '' ? null : parseFloat(trimmed);
-  if (trimmed !== '' && isNaN(freq)) { alert('Enter a valid number, or leave blank to clear.'); return; }
-  const res = await fetch('/devices/frequency', {
+  if (trimmed !== '' && isNaN(freq)) {
+    showFreqEditError(ip, 'Enter a valid number, or leave blank to clear.');
+    return;
+  }
+  const response = await fetch('/devices/frequency', {
     method: 'POST',
     body: JSON.stringify({ ip, frequency_mhz: freq }),
-  }).then(r => r.json());
+  });
+  const res = await response.json();
+  if (!response.ok) {
+    // Refused outright -- e.g. outside this unit's known tunable range.
+    // Nothing was saved; keep the editor open so it can be corrected.
+    showFreqEditError(ip, res.error || 'Frequency rejected.');
+    return;
+  }
+  editingFreq.delete(ip);
   if (freq !== null && !res.deployed) {
-    alert('Saved, but not pushed to hardware (device not connected) — it will only take effect once reconnected, or shows as a planning value.');
+    lastFreqNotice = {
+      ip,
+      text: res.deploy_error || 'Saved, but not pushed to hardware (device not connected) — takes effect once reconnected, or shows as a planning value.',
+    };
   }
   refresh();
 }
+
+let lastFreqNotice = null;
 
 // --- User Board layout (size + order) --------------------------------------
 // Admin-only controls for the /user board's card sizes and arrangement;
@@ -682,6 +877,11 @@ let dragIp = null;
 
 async function setCardSize(ip, size) {
   await fetch('/devices/card-size', { method: 'POST', body: JSON.stringify({ ip, size }) });
+  refresh();
+}
+
+async function setCardVisibility(ip, visible) {
+  await fetch('/devices/visibility', { method: 'POST', body: JSON.stringify({ ip, visible }) });
   refresh();
 }
 
@@ -734,10 +934,11 @@ function renderLayoutBoard(data) {
     const d = data[ip];
     const label = (d.assigned_user && d.assigned_user.trim()) || d.name || ip;
     const size = ['sm', 'md', 'lg'].includes(d.card_size) ? d.card_size : 'md';
+    const visible = d.visible_on_board !== false;
     const thumbStyle = d.photo ? `style="background-image:url('${d.photo}')"` : '';
     const thumbContent = d.photo ? '' : '🎤';
     return `
-      <div class="layout-card" draggable="true" data-ip="${ip}"
+      <div class="layout-card ${visible ? '' : 'layout-card-hidden'}" draggable="true" data-ip="${ip}"
            ondragstart="layoutDragStart(event, '${ip}')" ondragend="layoutDragEnd(event)"
            ondragover="layoutDragOver(event, '${ip}')" ondragleave="layoutDragLeave(event)"
            ondrop="layoutDrop(event, '${ip}')">
@@ -749,6 +950,9 @@ function renderLayoutBoard(data) {
           <button class="${size === 'md' ? 'active' : ''}" onclick="setCardSize('${ip}','md')">M</button>
           <button class="${size === 'lg' ? 'active' : ''}" onclick="setCardSize('${ip}','lg')">L</button>
         </div>
+        <button class="visibility-btn ${visible ? '' : 'off'}" onclick="setCardVisibility('${ip}', ${!visible})">
+          ${visible ? '👁 On Board' : '🚫 Hidden'}
+        </button>
       </div>`;
   }).join('');
 }
@@ -769,9 +973,26 @@ async function refresh() {
   renderSpectrumChart();
   renderLayoutBoard(data);
 
-  const ips = Object.keys(data);
+  // Skip rebuilding the device grid while a name/frequency edit is in
+  // progress -- the 2s poll cycle would otherwise wipe out unsaved keystrokes
+  // by replacing the whole grid's innerHTML out from under the live input.
+  // startNameEdit/cancelNameEdit/saveNameEdit (and the frequency equivalents)
+  // call renderDevices() directly instead, so opening/closing the editor
+  // itself always renders immediately regardless of this guard.
+  if (editingName.size === 0 && editingFreq.size === 0 && streamConfigOpen.size === 0) {
+    renderDevices(data);
+  }
+}
+
+function renderDevices(data) {
+  let ips = Object.keys(data);
+  if (danteOnlyFilter) {
+    ips = ips.filter(ip => data[ip].dante_status && data[ip].dante_status.interface_present);
+  }
   if (ips.length === 0) {
-    devicesEl.innerHTML = '<div class="empty">No devices yet — add one above.</div>';
+    devicesEl.innerHTML = danteOnlyFilter
+      ? '<div class="empty">No devices with a confirmed Dante interface right now -- a device needs to be connected at least once for this to be known.</div>'
+      : '<div class="empty">No devices yet — add one above.</div>';
     return;
   }
 
@@ -785,22 +1006,72 @@ async function refresh() {
     const alerts = (d.alerts && d.alerts.length)
       ? `<div class="alerts">⚠ ${d.alerts.slice(-3).join(', ')}</div>` : '';
     const history = historyVisible[ip] ? renderHistory(historyCache[ip]) : '';
+
+    const nameRow = editingName.has(ip) ? `
+        <input type="text" class="inline-edit-input" id="nameEdit-${CSS.escape(ip)}" value="${escAttr(d.name || '')}"
+          onkeydown="if(event.key==='Enter'){saveNameEdit('${ip}', this.value);} else if(event.key==='Escape'){cancelNameEdit('${ip}');}">
+        <button class="icon-btn" title="Save" onclick="saveNameEdit('${ip}', document.getElementById('nameEdit-${CSS.escape(ip)}').value)">✓</button>
+        <button class="icon-btn" title="Cancel" onclick="cancelNameEdit('${ip}')">✕</button>`
+      : `
+        <span class="device-name">${label}</span>
+        <button class="icon-btn" title="Rename" onclick="startNameEdit('${ip}')">✎</button>`;
+
+    let freqRow;
+    if (editingFreq.has(ip)) {
+      freqRow = `
+        <input type="text" inputmode="decimal" class="inline-edit-input" id="freqEdit-${CSS.escape(ip)}" placeholder="MHz, blank to clear" value="${d.frequency_mhz != null ? d.frequency_mhz : ''}"
+          onkeydown="if(event.key==='Enter'){saveFreqEdit('${ip}', this.value);} else if(event.key==='Escape'){cancelFreqEdit('${ip}');}">
+        <button class="icon-btn" title="Save" onclick="saveFreqEdit('${ip}', document.getElementById('freqEdit-${CSS.escape(ip)}').value)">✓</button>
+        <button class="icon-btn" title="Cancel" onclick="cancelFreqEdit('${ip}')">✕</button>`;
+    } else {
+      const bandLabel = d.rf_range_mhz && d.rf_range_mhz.length
+        ? `<span title="This unit's real tunable range, discovered from the hardware${d.rf_band ? ' (band ' + d.rf_band + ')' : ''}">· ${d.rf_range_mhz.map(([lo, hi]) => `${lo}-${hi}`).join(', ')} MHz</span>`
+        : '';
+      // "No frequency assigned" implies nobody's set one -- wrong for a
+      // device whose protocol structurally can't report a frequency at all
+      // (e.g. PSM1000's one-way transmitter link). The real hardware may
+      // well be tuned to something; this app just has no way to know it.
+      const freqLabel = d.frequency_mhz != null ? d.frequency_mhz.toFixed(3) + ' MHz'
+        : d.freq_unavailable_reason ? `<span style="color:var(--muted); font-style:italic" title="${d.freq_unavailable_reason}">${d.freq_unavailable_reason}</span>`
+        : 'No frequency assigned';
+      freqRow = `
+        ${freqLabel}
+        <button class="icon-btn" title="${d.freq_unavailable_reason ? 'Record a frequency for planning purposes (will not be pushed to hardware)' : 'Assign frequency'}" onclick="startFreqEdit('${ip}')">📻</button>
+        <button class="icon-btn" title="${lockedDevices.has(ip) ? 'Unlock (Calculate All will reassign it)' : 'Lock (Calculate All will keep its frequency and anchor around it)'}" onclick="toggleLock('${ip}')">${lockedDevices.has(ip) ? '🔒' : '🔓'}</button>
+        ${bandLabel}`;
+      if (lastFreqNotice && lastFreqNotice.ip === ip) {
+        freqRow += `<div class="device-meta" style="width:100%; color:var(--warn)">${lastFreqNotice.text}</div>`;
+        lastFreqNotice = null;
+      }
+    }
+
+    const isTransmitter = d.role === 'transmitter';
+    const roleBadge = `<span class="role-badge ${isTransmitter ? 'tx' : 'rx'}" title="${isTransmitter ? 'Transmitter -- sends audio out to a body-worn receiver pack (e.g. an IEM beltpack)' : 'Receiver -- picks up RF from a body-worn mic/instrument transmitter'}">${isTransmitter ? 'TX' : 'RX'}</span>`;
+    // Confirmed live from each unit's own control protocol (not guessed) --
+    // Sennheiser SSC devices report interface/IP/auto; Shure devices report
+    // it via the real NA_DEVICE_NAME command string (confirmed against a
+    // live ULXD4Q). Either way, present at all only once a device has
+    // actually connected; null means "not yet queried" (e.g. currently
+    // unreachable), not "no Dante interface".
+    let danteBadge = '';
+    if (d.dante_status) {
+      if (d.dante_status.interface_present) {
+        const ds = d.dante_status;
+        const detail = [ds.device_name, ds.ip, ds.auto === true ? 'DHCP/auto' : ds.auto === false ? 'static' : null].filter(Boolean).join(', ');
+        danteBadge = `<span class="dante-badge on" title="Dante interface confirmed present on this unit (queried live via its own control protocol)${detail ? ' -- ' + detail : ''}">🔗 Dante</span>`;
+      } else {
+        danteBadge = `<span class="dante-badge off" title="Queried this unit's own control protocol -- no Dante interface reported">No Dante</span>`;
+      }
+    }
     return `
       <div class="device" data-ip="${ip}">
         <div class="device-head">
           <div class="device-title">
             <div class="brand-badge ${brand}">${brandInitial}</div>
             <div>
-              <div class="device-name-row">
-                <span class="device-name">${label}</span>
-                <button class="icon-btn" title="Rename" onclick="renameDevice('${ip}', ${JSON.stringify(label)})">✎</button>
-              </div>
+              <div class="device-name-row">${nameRow}${roleBadge}${danteBadge}</div>
               <div class="device-ip">${ip} · ${d.type || ''}${d.channel ? ' · ch ' + d.channel : ''}</div>
-              <div class="device-freq-row device-meta">
-                ${d.frequency_mhz != null ? d.frequency_mhz.toFixed(3) + ' MHz' : 'No frequency assigned'}
-                <button class="icon-btn" title="Assign frequency" onclick="assignDeviceFrequency('${ip}', ${d.frequency_mhz ?? 'null'})">📻</button>
-                <button class="icon-btn" title="${lockedDevices.has(ip) ? 'Unlock (Calculate All will reassign it)' : 'Lock (Calculate All will keep its frequency and anchor around it)'}" onclick="toggleLock('${ip}')">${lockedDevices.has(ip) ? '🔒' : '🔓'}</button>
-              </div>
+              <div class="device-freq-row device-meta">${freqRow}</div>
             </div>
           </div>
           <div class="status-line ${d.status}"><span class="status-dot ${d.status}"></span>${d.status}</div>
@@ -810,8 +1081,13 @@ async function refresh() {
         <div class="device-actions">
           <button class="secondary ${liveScans[ip] ? 'live' : ''}" onclick="toggleLiveScan('${ip}')">${liveScans[ip] ? '⏸ Stop Live Scan' : '▶ Start Live Scan'}</button>
           <button class="secondary" onclick="toggleHistory('${ip}')">${historyVisible[ip] ? 'Hide History' : 'History'}</button>
+          ${listenSockets[ip]
+            ? `<button class="secondary live" onclick="stopListen('${ip}')">⏸ Stop Listen</button>`
+            : `<button class="secondary" onclick="startListen('${ip}')" ${d.listen_stream ? '' : 'disabled title="Configure a listen stream first"'}>🎧 Listen</button>`}
+          <button class="secondary" onclick="toggleStreamConfig('${ip}')">🎛 ${d.listen_stream ? 'Edit' : 'Configure'} Stream</button>
           <button class="danger" onclick="removeDevice('${ip}')">Remove</button>
         </div>
+        ${renderStreamConfig(ip, d)}
         <div class="spectrum" id="spectrum-${CSS.escape(ip)}">${renderSpectrum(spectrumCache[ip])}</div>
         ${history}
       </div>`;
@@ -842,8 +1118,147 @@ async function removeDevice(ip) {
     clearInterval(liveScans[ip]);
     delete liveScans[ip];
   }
+  if (listenSockets[ip]) stopListen(ip);
   await fetch('/devices?ip=' + encodeURIComponent(ip), { method: 'DELETE' });
   refresh();
+}
+
+// --- Real-time AES67 "listen" ---------------------------------------------
+
+function renderStreamConfig(ip, d) {
+  if (!streamConfigOpen.has(ip)) return '';
+  const s = d.listen_stream || {};
+  const detected = Object.entries(sapStreamsCache);
+  const detectedPicker = detected.length
+    ? `<select id="sapPick-${CSS.escape(ip)}" onchange="applyDetectedStream('${ip}', this.value)">
+         <option value="">-- fill in from a detected stream --</option>
+         ${detected.map(([name, st]) => `<option value="${escAttr(name)}">${escAttr(name)} (${st.multicast_addr}:${st.port}, ${st.encoding}/${st.sample_rate}/${st.channels}ch)</option>`).join('')}
+       </select>`
+    : `<span class="device-meta">No AES67 streams detected via SAP on this network yet -- enter the multicast address manually below.</span>`;
+  return `
+    <div class="stream-config-form">
+      <div class="device-meta">AES67 listen stream -- the multicast RTP address carrying this channel's live audio (from Dante Controller with AES67 mode enabled, or any AES67 sender):</div>
+      ${detectedPicker}
+      <div class="stream-config-fields">
+        <input type="text" id="scAddr-${CSS.escape(ip)}" placeholder="Multicast addr, e.g. 239.69.1.2" value="${escAttr(s.multicast_addr || '')}">
+        <input type="number" id="scPort-${CSS.escape(ip)}" placeholder="Port" value="${s.port || ''}" style="width:90px">
+        <select id="scEncoding-${CSS.escape(ip)}" style="width:90px">
+          <option value="L16" ${s.encoding === 'L24' ? '' : 'selected'}>L16</option>
+          <option value="L24" ${s.encoding === 'L24' ? 'selected' : ''}>L24</option>
+        </select>
+        <input type="number" id="scRate-${CSS.escape(ip)}" placeholder="Sample rate" value="${s.sample_rate || 48000}" style="width:110px">
+        <input type="number" id="scChannels-${CSS.escape(ip)}" placeholder="Channels" value="${s.channels || 1}" style="width:90px">
+        <input type="number" id="scPT-${CSS.escape(ip)}" placeholder="Payload type" value="${s.payload_type || 97}" style="width:110px">
+      </div>
+      <div class="stream-config-actions">
+        <button onclick="saveStreamConfig('${ip}')">Save</button>
+        ${d.listen_stream ? `<button class="danger" onclick="clearStreamConfig('${ip}')">Clear</button>` : ''}
+        <button class="secondary" onclick="toggleStreamConfig('${ip}')">Cancel</button>
+      </div>
+    </div>`;
+}
+
+function toggleStreamConfig(ip) {
+  if (streamConfigOpen.has(ip)) {
+    streamConfigOpen.delete(ip);
+  } else {
+    streamConfigOpen.add(ip);
+    loadSapStreams();
+  }
+  renderDevices(lastData);
+}
+
+function applyDetectedStream(ip, name) {
+  const st = sapStreamsCache[name];
+  if (!st) return;
+  document.getElementById('scAddr-' + CSS.escape(ip)).value = st.multicast_addr;
+  document.getElementById('scPort-' + CSS.escape(ip)).value = st.port;
+  document.getElementById('scEncoding-' + CSS.escape(ip)).value = st.encoding;
+  document.getElementById('scRate-' + CSS.escape(ip)).value = st.sample_rate;
+  document.getElementById('scChannels-' + CSS.escape(ip)).value = st.channels;
+  document.getElementById('scPT-' + CSS.escape(ip)).value = st.payload_type;
+}
+
+async function loadSapStreams() {
+  try {
+    const res = await fetch('/discover/sap-streams').then(r => r.json());
+    sapStreamsCache = res.streams || {};
+  } catch (e) { /* SAP discovery is best-effort -- leave the manual fields usable either way */ }
+  if (streamConfigOpen.size > 0) renderDevices(lastData);
+}
+
+async function saveStreamConfig(ip) {
+  const addr = document.getElementById('scAddr-' + CSS.escape(ip)).value.trim();
+  const port = parseInt(document.getElementById('scPort-' + CSS.escape(ip)).value, 10);
+  const encoding = document.getElementById('scEncoding-' + CSS.escape(ip)).value;
+  const sample_rate = parseInt(document.getElementById('scRate-' + CSS.escape(ip)).value, 10) || 48000;
+  const channels = parseInt(document.getElementById('scChannels-' + CSS.escape(ip)).value, 10) || 1;
+  const payload_type = parseInt(document.getElementById('scPT-' + CSS.escape(ip)).value, 10) || 97;
+  if (!addr || !port) {
+    alert('Multicast address and port are required.');
+    return;
+  }
+  await fetch('/devices/listen-stream', {
+    method: 'POST',
+    body: JSON.stringify({ ip, multicast_addr: addr, port, encoding, sample_rate, channels, payload_type }),
+  });
+  streamConfigOpen.delete(ip);
+  refresh();
+}
+
+async function clearStreamConfig(ip) {
+  await fetch('/devices/listen-stream?ip=' + encodeURIComponent(ip), { method: 'DELETE' });
+  streamConfigOpen.delete(ip);
+  refresh();
+}
+
+// Plays incoming PCM chunks back-to-back via WebAudio's own scheduler
+// (each chunk gets its own AudioBufferSourceNode, started right after the
+// previous one ends) rather than anything requiring an AudioWorklet module
+// file -- keeps this dependency-free and consistent with the rest of this
+// app's plain-JS static frontend.
+function startListen(ip) {
+  const d = lastData[ip];
+  const streamInfo = d && d.listen_stream;
+  if (!streamInfo) { alert('Configure a listen stream for this device first.'); return; }
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/listen/${encodeURIComponent(ip)}`);
+  ws.binaryType = 'arraybuffer';
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const channels = streamInfo.channels || 1;
+  const sampleRate = streamInfo.sample_rate || 48000;
+  const state = { ws, ctx, nextTime: 0, channels, sampleRate };
+  listenSockets[ip] = state;
+
+  ws.onmessage = (evt) => {
+    const int16 = new Int16Array(evt.data);
+    const frames = Math.floor(int16.length / channels);
+    if (frames <= 0) return;
+    const buffer = ctx.createBuffer(channels, frames, sampleRate);
+    for (let c = 0; c < channels; c++) {
+      const chData = buffer.getChannelData(c);
+      for (let i = 0; i < frames; i++) chData[i] = int16[i * channels + c] / 32768;
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(ctx.destination);
+    const now = ctx.currentTime;
+    const startAt = Math.max(now + 0.05, state.nextTime);
+    src.start(startAt);
+    state.nextTime = startAt + buffer.duration;
+  };
+  ws.onclose = () => { delete listenSockets[ip]; renderDevices(lastData); };
+  ws.onerror = () => { delete listenSockets[ip]; renderDevices(lastData); };
+  renderDevices(lastData);
+}
+
+function stopListen(ip) {
+  const state = listenSockets[ip];
+  if (!state) return;
+  try { state.ws.close(); } catch (e) {}
+  try { state.ctx.close(); } catch (e) {}
+  delete listenSockets[ip];
+  renderDevices(lastData);
 }
 
 document.getElementById('addForm').addEventListener('submit', async (e) => {
@@ -857,7 +1272,6 @@ document.getElementById('addForm').addEventListener('submit', async (e) => {
       name: fd.get('name'),
       brand: fd.get('brand'),
       type: type,
-      channel: fd.get('channel'),
     }),
   });
   e.target.reset();
@@ -1194,10 +1608,41 @@ function toggleLock(ip) {
   refresh();
 }
 
-async function calculateAllAndDeploy() {
+// Calculate All and Deploy are separate steps -- running the coordination
+// math shouldn't force a push to live hardware. calculateAll() only computes
+// and previews suggested frequencies; deployCalculated() pushes that exact
+// preview to /devices/frequency once the operator confirms it.
+let pendingAssignments = null; // { ip: frequency_mhz } from the last Calculate, not yet deployed
+
+function updateDeployButtonState() {
+  const btn = document.getElementById('deployCalculatedBtn');
+  if (!btn) return;
+  btn.disabled = !pendingAssignments || !Object.keys(pendingAssignments).length;
+}
+
+function renderPendingAssignments() {
+  const resultsEl = document.getElementById('coordResults');
+  const rows = Object.entries(pendingAssignments).map(([ip, freq]) => {
+    const d = lastData[ip] || {};
+    const current = d.frequency_mhz != null ? d.frequency_mhz.toFixed(3) + ' MHz' : '—';
+    return `<tr><td>${d.name || ip}</td><td>${current}</td><td>${freq.toFixed(3)} MHz</td></tr>`;
+  }).join('');
+  resultsEl.innerHTML = `
+    <div class="device-meta" style="margin-bottom:6px">
+      Calculated ${Object.keys(pendingAssignments).length} clean frequency(s) — review below, then click Deploy to push them to hardware.
+    </div>
+    <table class="freq-table">
+      <thead><tr><th>Device</th><th>Current</th><th>Calculated</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function calculateAll() {
   const resultsEl = document.getElementById('coordResults');
   const allIps = Object.keys(lastData);
   const unlockedIps = allIps.filter(ip => !lockedDevices.has(ip));
+  pendingAssignments = null;
+  updateDeployButtonState();
   if (!unlockedIps.length) {
     resultsEl.innerHTML = '<div class="empty">All devices are locked — nothing to calculate.</div>';
     return;
@@ -1223,16 +1668,43 @@ async function calculateAllAndDeploy() {
     resultsEl.innerHTML = `<div class="empty">Only found ${suggested.length} clean frequencies for ${unlockedIps.length} device(s) — narrow your exclusions or reduce device count.</div>`;
     return;
   }
-  const assignResults = await Promise.all(unlockedIps.map((ip, i) =>
-    fetch('/devices/frequency', { method: 'POST', body: JSON.stringify({ ip, frequency_mhz: suggested[i] }) }).then(r => r.json())
-  ));
+  pendingAssignments = {};
+  unlockedIps.forEach((ip, i) => { pendingAssignments[ip] = suggested[i]; });
+  renderPendingAssignments();
+  updateDeployButtonState();
+}
+
+async function deployCalculated() {
+  if (!pendingAssignments || !Object.keys(pendingAssignments).length) return;
+  const resultsEl = document.getElementById('coordResults');
+  const entries = Object.entries(pendingAssignments);
+  resultsEl.innerHTML = `<div class="device-meta">Deploying ${entries.length} frequency(s)...</div>`;
+  const assignResults = await Promise.all(entries.map(async ([ip, freq]) => {
+    const response = await fetch('/devices/frequency', { method: 'POST', body: JSON.stringify({ ip, frequency_mhz: freq }) });
+    const json = await response.json();
+    return { ip, ok: response.ok, ...json };
+  }));
+  // A device whose real tunable range doesn't cover the calculated
+  // frequency is refused outright (ok: false) rather than silently
+  // "not deployed" -- surface those separately so they don't read as a
+  // routine connectivity issue.
+  const refused = assignResults.filter(r => !r.ok);
   const deployedCount = assignResults.filter(r => r.deployed).length;
-  resultsEl.innerHTML = `<div class="device-meta" style="color:var(--ok)">Assigned ${suggested.length} clean frequencies to ${unlockedIps.length} device(s) — ${deployedCount} pushed live to connected hardware, ${unlockedIps.length - deployedCount} saved locally only.</div>`;
+  const savedCount = assignResults.length - refused.length;
+  let summary = `Assigned ${savedCount} clean frequencies — ${deployedCount} pushed live to connected hardware, ${savedCount - deployedCount} saved locally only.`;
+  if (refused.length) {
+    summary += `<br>${refused.length} refused: ` + refused.map(r => `${lastData[r.ip]?.name || r.ip} (${r.error})`).join('; ');
+  }
+  resultsEl.innerHTML = `<div class="device-meta" style="color:${refused.length ? 'var(--bad)' : 'var(--ok)'}">${summary}</div>`;
+  pendingAssignments = null;
+  updateDeployButtonState();
   refresh();
 }
 
 async function checkCoordination() {
   const resultsEl = document.getElementById('coordResults');
+  pendingAssignments = null;
+  updateDeployButtonState();
   resultsEl.innerHTML = '<div class="device-meta">Checking...</div>';
   const res = await fetch('/coordination/check', {
     method: 'POST',
@@ -1256,6 +1728,8 @@ async function checkCoordination() {
 
 async function suggestFrequencies() {
   const resultsEl = document.getElementById('coordResults');
+  pendingAssignments = null;
+  updateDeployButtonState();
   const count = parseInt(document.getElementById('suggestCount').value, 10) || 1;
   resultsEl.innerHTML = '<div class="device-meta">Calculating...</div>';
   const res = await fetch('/coordination/suggest', {
@@ -1316,7 +1790,9 @@ loadAutoDiscoveryState();
 renderScanExclusionChips();
 renderManualExclusionChips();
 refresh();
-setInterval(refresh, 2000);
+// Matches the backend's poll_devices() cadence (omniwave.py) so the audio
+// meter reads as live rather than visibly stepping.
+setInterval(refresh, 500);
 </script>
 </body>
 </html>
