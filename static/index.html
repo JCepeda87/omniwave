@@ -58,6 +58,11 @@
   }
   h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -.01em; }
   .subtitle { color: var(--muted); font-size: 13px; }
+  .location-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 13px; }
+  .location-row select {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 8px; font-size: 13px;
+  }
   .stats { display: flex; gap: 10px; flex-wrap: wrap; }
   .stat {
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
@@ -269,6 +274,10 @@
     <div>
       <h1>OmniWave</h1>
       <div class="subtitle">Wireless mic & RF system dashboard</div>
+      <div class="location-row">
+        📍 <select id="locationSelect" onchange="onLocationSelectChange(this.value)"></select>
+        <button class="icon-btn" title="Switch to or create a different location" onclick="promptNewLocation()">+ New</button>
+      </div>
     </div>
     <div class="stats">
       <div class="stat"><div class="stat-val" id="statTotal">0</div><div class="stat-label">Devices</div></div>
@@ -1131,7 +1140,7 @@ async function removeDevice(ip) {
 async function removeAllDevices() {
   const ips = Object.keys(lastData || {});
   if (!ips.length) return;
-  if (!confirm(`Remove all ${ips.length} device(s)? This clears the board completely -- you'll need to rediscover or re-add them.`)) return;
+  if (!confirm(`Remove all ${ips.length} device(s) in "${activeLocation}"? This clears this location's board completely -- you'll need to rediscover or re-add them. Other locations are not affected.`)) return;
   const btn = document.getElementById('removeAllBtn');
   btn.disabled = true;
   try {
@@ -1811,6 +1820,44 @@ async function assignSuggested(freq, idx) {
   refresh();
 }
 
+// --- Locations --------------------------------------------------------
+// Devices/DeviceNames/etc. on the backend only ever hold the ACTIVE
+// location's units (see switch_active_location() in omniwave.py) -- so
+// switching here means the whole board changes, not just a filter.
+let activeLocation = 'Default';
+
+async function loadLocations() {
+  const res = await fetch('/locations').then(r => r.json());
+  activeLocation = res.active;
+  const sel = document.getElementById('locationSelect');
+  sel.innerHTML = res.locations.map(name =>
+    `<option value="${escAttr(name)}" ${name === activeLocation ? 'selected' : ''}>${name}</option>`).join('');
+}
+
+async function onLocationSelectChange(name) {
+  if (name === activeLocation) return;
+  await switchLocation(name);
+}
+
+async function promptNewLocation() {
+  const name = prompt('Switch to or create a location:', '');
+  if (!name || !name.trim()) return;
+  await switchLocation(name.trim());
+}
+
+async function switchLocation(name) {
+  const sel = document.getElementById('locationSelect');
+  sel.disabled = true;
+  try {
+    await fetch('/locations', { method: 'POST', body: JSON.stringify({ name }) });
+    await loadLocations();
+    refresh();
+  } finally {
+    sel.disabled = false;
+  }
+}
+
+loadLocations();
 loadRegions();
 loadAutoDiscoveryState();
 renderScanExclusionChips();

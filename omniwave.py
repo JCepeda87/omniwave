@@ -57,6 +57,20 @@ DeviceFrequencies = {}  # key -> assigned carrier frequency in MHz
 DeviceLayout = {}  # key -> {'size': 'sm'|'md'|'lg', 'order': int} -- User Board card layout, admin-only
 DeviceListenStreams = {}  # key -> AES67 stream dict (multicast_addr/port/payload_type/encoding/sample_rate/channels)
 
+# This app moves between venues constantly (see HANDOVER.md), and a flat
+# device list accumulates every unit ever seen at every venue -- useless for
+# "just show me tonight's rig." Devices/DeviceNames/etc. above are therefore
+# scoped: they only ever hold the CURRENTLY ACTIVE location's units in
+# memory (and connected). config.json still holds every device from every
+# location, each tagged with 'location'; switching the active location
+# disconnects everything currently loaded and reconnects just that
+# location's saved entries (see switch_active_location()). DataHandler and
+# every discovery/auto-add path need no location-awareness of their own --
+# they already only ever see what's in Devices, which is exactly "this
+# location" by construction.
+DEFAULT_LOCATION = 'Default'
+ACTIVE_LOCATION = DEFAULT_LOCATION  # overwritten from config.json at startup, see main()
+
 # One RTPReceiver per device key, created lazily on first "Listen" click and
 # torn down when the last listener leaves (see aes67.RTPReceiver) -- kept
 # here rather than on the provider itself since it's a continuous media
@@ -460,11 +474,13 @@ class DeviceHandler(RequestHandler):
             self.set_status(404)
 
 class RemoveAllDevicesHandler(RequestHandler):
-    """Clears every device at once -- for getting back to a clean board
-    (e.g. between events/venues) without clicking Remove on each one.
-    Same per-device teardown as DeviceHandler.delete (disconnect, drop from
-    every in-memory dict), then a single config.json rewrite instead of one
-    per device."""
+    """Clears every device in the ACTIVE location at once -- for getting
+    back to a clean board between events/venues without clicking Remove on
+    each one. Scoped to the current location, not every device ever saved:
+    Devices only ever holds the active location's units (see
+    switch_active_location), so `keys` here already is exactly "this
+    location's devices" -- other locations' saved devices are untouched in
+    config.json."""
     async def post(self):
         keys = list(Devices.keys())
         for key in keys:
@@ -476,8 +492,9 @@ class RemoveAllDevicesHandler(RequestHandler):
             DeviceFrequencies.pop(key, None)
             DeviceLayout.pop(key, None)
             DeviceListenStreams.pop(key, None)
-        save_config([])
-        self.write(json.dumps({'success': True, 'removed': len(keys)}))
+        remaining = [d for d in load_config() if d.get('location', DEFAULT_LOCATION) != ACTIVE_LOCATION]
+        save_config(remaining)
+        self.write(json.dumps({'success': True, 'removed': len(keys), 'location': ACTIVE_LOCATION}))
 
 class RenameHandler(RequestHandler):
     """Relabel a device's unit name without touching its connection, unlike
@@ -1521,25 +1538,72 @@ async def poll_devices():
         await asyncio.gather(*(_poll_one_device(ip, dev) for ip, dev in list(Devices.items())))
     IOLoop.current().call_later(0.5, lambda: IOLoop.current().spawn_callback(poll_devices))
 
-def load_config():
-    if not os.path.exists(CONFIG_PATH): return []
+def load_full_config():
+    """The whole config.json shape: devices (each tagged with a location),
+    which location is active, and the full list of known location names
+    (kept even for locations with zero devices right now, so a freshly
+    created empty location survives a restart). Devices saved before the
+    location feature existed have no 'location' field -- defaulted to
+    DEFAULT_LOCATION here so nothing already on a user's board silently
+    disappears when this ships."""
+    if not os.path.exists(CONFIG_PATH):
+        return {'devices': [], 'active_location': DEFAULT_LOCATION, 'locations': [DEFAULT_LOCATION]}
     with open(CONFIG_PATH, 'r') as f:
-        return json.load(f).get('devices', [])
+        cfg = json.load(f)
+    devices = cfg.get('devices', [])
+    for d in devices:
+        d.setdefault('location', DEFAULT_LOCATION)
+    locations = cfg.get('locations') or []
+    for d in devices:
+        if d['location'] not in locations:
+            locations.append(d['location'])
+    if DEFAULT_LOCATION not in locations:
+        locations.append(DEFAULT_LOCATION)
+    active = cfg.get('active_location', DEFAULT_LOCATION)
+    if active not in locations:
+        locations.append(active)
+    return {'devices': devices, 'active_location': active, 'locations': locations}
+
+def load_config():
+    """Device list only (all locations), for callers that just need the
+    saved devices and don't touch location metadata."""
+    return load_full_config()['devices']
 
 def save_config(device_list):
+    """Writes the device list while preserving whatever location metadata
+    is already on disk -- every call site here only ever changes devices,
+    never locations/active_location directly (see save_locations_meta)."""
+    full = load_full_config()
+    full['devices'] = device_list
     with open(CONFIG_PATH, 'w') as f:
-        json.dump({'devices': device_list}, f, indent=2)
+        json.dump(full, f, indent=2)
 
-# Every config.json entry is identified by (ip, channel), not ip alone --
-# a multi-channel receiver has several entries sharing the same ip. Matching
-# on ip alone here used to mean adding/updating one channel of a device
-# would silently clobber every other channel's entry for that same ip.
+def save_locations_meta(active_location, locations):
+    full = load_full_config()
+    full['active_location'] = active_location
+    full['locations'] = locations
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(full, f, indent=2)
+
+# Every config.json entry is identified by (ip, channel, location), not
+# just (ip, channel) -- a multi-channel receiver has several entries
+# sharing the same ip, AND different venues can easily reuse the same
+# private IP range, so the same ip:channel can legitimately exist under two
+# different locations' history at once. Every update_device_*_in_config
+# function below is only ever called for a device the caller already has
+# loaded (i.e. one in the ACTIVE location), so matching against
+# ACTIVE_LOCATION here -- rather than threading a location param through
+# every one of those call sites -- is both correct and far less invasive.
 def _same_device(entry, ip, channel):
-    return entry.get('ip') == ip and int(entry.get('channel', 1)) == channel
+    return (entry.get('ip') == ip and int(entry.get('channel', 1)) == channel
+            and entry.get('location', DEFAULT_LOCATION) == ACTIVE_LOCATION)
 
-def save_device_to_config(ip, brand, dtype, name='', channel=1):
+def save_device_to_config(ip, brand, dtype, name='', channel=1, location=None):
     devices = [d for d in load_config() if not _same_device(d, ip, channel)]
-    devices.append({'ip': ip, 'brand': brand, 'type': dtype, 'name': name, 'channel': channel})
+    devices.append({
+        'ip': ip, 'brand': brand, 'type': dtype, 'name': name, 'channel': channel,
+        'location': location or ACTIVE_LOCATION,
+    })
     save_config(devices)
 
 def remove_device_from_config(ip, channel=1):
@@ -1605,10 +1669,100 @@ def update_device_photo_in_config(ip, channel, photo_url):
             d['photo'] = photo_url
     save_config(devices)
 
+async def _connect_loaded_device(key, dev, dev_cfg, idx):
+    await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.connect)
+    dev.photo = dev_cfg.get('photo')
+    DeviceNames[key] = dev_cfg.get('name', '')
+    DeviceAssignedUsers[key] = dev_cfg.get('assigned_user', '')
+    DeviceLayout[key] = {
+        'size': dev_cfg.get('card_size', 'md'),
+        'order': dev_cfg.get('card_order', idx),
+        'visible': dev_cfg.get('visible', True),
+    }
+    if dev_cfg.get('frequency_mhz') is not None:
+        DeviceFrequencies[key] = dev_cfg['frequency_mhz']
+    if dev_cfg.get('listen_stream'):
+        DeviceListenStreams[key] = dev_cfg['listen_stream']
+
+async def _load_location(location, device_list=None):
+    """Connects every saved device tagged with `location` (in parallel,
+    same asyncio.gather pattern poll_devices() uses for N-devices-at-once
+    work), populating Devices and the per-device dicts. Shared by startup
+    (main(), via run_sync) and runtime location switching (below) so
+    there's exactly one place that knows how a config.json entry becomes a
+    live, connected device."""
+    if device_list is None:
+        device_list = load_config()
+    matching = [d for d in device_list if d.get('location', DEFAULT_LOCATION) == location]
+    tasks = []
+    for idx, dev_cfg in enumerate(matching):
+        ip = dev_cfg['ip']
+        brand = dev_cfg.get('brand', 'shure')
+        dtype = dev_cfg.get('type', 'axtd')
+        channel = dev_cfg.get('channel', 1)
+        key = device_key(ip, channel)
+        dev = make_provider(ip, brand, dtype, channel)
+        Devices[key] = dev
+        tasks.append(_connect_loaded_device(key, dev, dev_cfg, idx))
+    if tasks:
+        await asyncio.gather(*tasks)
+
+async def _unload_all_devices():
+    """Disconnects and drops everything currently loaded -- used before
+    loading a different location in, so Devices never holds two locations'
+    worth of units (and their composite ip:channel keys, which can
+    legitimately collide across locations -- see _same_device) at once."""
+    if Devices:
+        await asyncio.gather(*(
+            IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.disconnect) for dev in Devices.values()
+        ))
+    Devices.clear()
+    DeviceNames.clear()
+    DeviceAssignedUsers.clear()
+    DeviceFrequencies.clear()
+    DeviceLayout.clear()
+    DeviceListenStreams.clear()
+
+async def switch_active_location(name):
+    """Tears down the currently-loaded location's devices and loads the
+    named one instead, then persists the switch so it's still active after
+    a restart. `name` need not already exist in config.json's locations
+    list -- switching to a brand-new name both creates and activates it
+    (there's deliberately no separate "create location" step beyond that)."""
+    global ACTIVE_LOCATION
+    await _unload_all_devices()
+    ACTIVE_LOCATION = name
+    await _load_location(name)
+    full = load_full_config()
+    locations = full['locations']
+    if name not in locations:
+        locations.append(name)
+    save_locations_meta(name, locations)
+
+class LocationsHandler(RequestHandler):
+    """GET: every known location name (including empty ones) plus which is
+    active. POST {name}: switch to it, creating it first if it's new."""
+    def get(self):
+        full = load_full_config()
+        self.write(json.dumps({'locations': full['locations'], 'active': ACTIVE_LOCATION}))
+
+    async def post(self):
+        params = json.loads(self.request.body)
+        name = (params.get('name') or '').strip()
+        if not name:
+            self.set_status(400)
+            self.write(json.dumps({'error': 'name is required'}))
+            return
+        if name == ACTIVE_LOCATION:
+            self.write(json.dumps({'success': True, 'active': ACTIVE_LOCATION, 'changed': False}))
+            return
+        await switch_active_location(name)
+        self.write(json.dumps({'success': True, 'active': ACTIVE_LOCATION, 'changed': True}))
+
 def main():
     init_db()
     register_installation()
-    
+
     app = Application([
         (r'/', IndexHandler),
         (r'/user', UserIndexHandler),
@@ -1622,6 +1776,7 @@ def main():
         (r'/system/update', UpdateHandler),
         (r'/devices', DeviceHandler),
         (r'/devices/remove-all', RemoveAllDevicesHandler),
+        (r'/locations', LocationsHandler),
         (r'/devices/rename', RenameHandler),
         (r'/devices/assign-user', AssignUserHandler),
         (r'/devices/card-size', CardSizeHandler),
@@ -1640,27 +1795,10 @@ def main():
         (r'/static/(.*)', StaticHandler),
     ])
     app.listen(9000, address='0.0.0.0')
-    device_list = load_config()
-    for idx, dev_cfg in enumerate(device_list):
-        ip = dev_cfg['ip']
-        brand = dev_cfg.get('brand', 'shure')
-        dtype = dev_cfg.get('type', 'axtd')
-        channel = dev_cfg.get('channel', 1)
-        key = device_key(ip, channel)
-        Devices[key] = make_provider(ip, brand, dtype, channel)
-        Devices[key].connect()
-        Devices[key].photo = dev_cfg.get('photo')
-        DeviceNames[key] = dev_cfg.get('name', '')
-        DeviceAssignedUsers[key] = dev_cfg.get('assigned_user', '')
-        DeviceLayout[key] = {
-            'size': dev_cfg.get('card_size', 'md'),
-            'order': dev_cfg.get('card_order', idx),
-            'visible': dev_cfg.get('visible', True),
-        }
-        if dev_cfg.get('frequency_mhz') is not None:
-            DeviceFrequencies[key] = dev_cfg['frequency_mhz']
-        if dev_cfg.get('listen_stream'):
-            DeviceListenStreams[key] = dev_cfg['listen_stream']
+    global ACTIVE_LOCATION
+    full_cfg = load_full_config()
+    ACTIVE_LOCATION = full_cfg['active_location']
+    IOLoop.current().run_sync(lambda: _load_location(ACTIVE_LOCATION, full_cfg['devices']))
 
     _sap_listener.start()
     IOLoop.current().spawn_callback(poll_devices)
