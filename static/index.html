@@ -75,6 +75,8 @@
     margin-bottom: 16px;
   }
   .panel h2 { font-size: 13px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .panel-head-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .panel-head-row h2 { margin: 0 0 12px; }
   details.panel { padding: 0; }
   details.panel > summary {
     list-style: none; cursor: pointer; padding: 14px 16px; font-size: 13px;
@@ -453,7 +455,10 @@
   </details>
 
   <div class="panel">
-    <h2>Devices</h2>
+    <div class="panel-head-row">
+      <h2>Devices</h2>
+      <button class="danger" id="removeAllBtn" onclick="removeAllDevices()">Remove All</button>
+    </div>
     <div class="device-filter-row">
       <label><input type="checkbox" id="danteOnlyToggle" onchange="toggleDanteFilter(this.checked)"> Show Dante-confirmed devices only</label>
     </div>
@@ -1121,6 +1126,27 @@ async function removeDevice(ip) {
   if (listenSockets[ip]) stopListen(ip);
   await fetch('/devices?ip=' + encodeURIComponent(ip), { method: 'DELETE' });
   refresh();
+}
+
+async function removeAllDevices() {
+  const ips = Object.keys(lastData || {});
+  if (!ips.length) return;
+  if (!confirm(`Remove all ${ips.length} device(s)? This clears the board completely -- you'll need to rediscover or re-add them.`)) return;
+  const btn = document.getElementById('removeAllBtn');
+  btn.disabled = true;
+  try {
+    ips.forEach(ip => {
+      if (liveScans[ip]) {
+        clearInterval(liveScans[ip]);
+        delete liveScans[ip];
+      }
+      if (listenSockets[ip]) stopListen(ip);
+    });
+    await fetch('/devices/remove-all', { method: 'POST' });
+    refresh();
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // --- Real-time AES67 "listen" ---------------------------------------------

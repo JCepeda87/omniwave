@@ -453,10 +453,31 @@ class DeviceHandler(RequestHandler):
             DeviceAssignedUsers.pop(key, None)
             DeviceFrequencies.pop(key, None)
             DeviceLayout.pop(key, None)
+            DeviceListenStreams.pop(key, None)
             remove_device_from_config(dev.ip, dev.channel)
             self.write(json.dumps({'success': True}))
         else:
             self.set_status(404)
+
+class RemoveAllDevicesHandler(RequestHandler):
+    """Clears every device at once -- for getting back to a clean board
+    (e.g. between events/venues) without clicking Remove on each one.
+    Same per-device teardown as DeviceHandler.delete (disconnect, drop from
+    every in-memory dict), then a single config.json rewrite instead of one
+    per device."""
+    async def post(self):
+        keys = list(Devices.keys())
+        for key in keys:
+            dev = Devices[key]
+            await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.disconnect)
+            del Devices[key]
+            DeviceNames.pop(key, None)
+            DeviceAssignedUsers.pop(key, None)
+            DeviceFrequencies.pop(key, None)
+            DeviceLayout.pop(key, None)
+            DeviceListenStreams.pop(key, None)
+        save_config([])
+        self.write(json.dumps({'success': True, 'removed': len(keys)}))
 
 class RenameHandler(RequestHandler):
     """Relabel a device's unit name without touching its connection, unlike
@@ -1600,6 +1621,7 @@ def main():
         (r'/discover/sap-streams', SapStreamsHandler),
         (r'/system/update', UpdateHandler),
         (r'/devices', DeviceHandler),
+        (r'/devices/remove-all', RemoveAllDevicesHandler),
         (r'/devices/rename', RenameHandler),
         (r'/devices/assign-user', AssignUserHandler),
         (r'/devices/card-size', CardSizeHandler),
