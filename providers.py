@@ -395,6 +395,28 @@ class ShureProvider(BaseProvider):
 UHFR_METER_STEPS = 40  # 40 * 30ms ~= 1.2s update interval
 UHFR_MISS_LIMIT = 5    # consecutive empty polls before considering it unreachable
 
+# eee's 0-255 range is Shure's own documented full-scale (confirmed against
+# the official PDF above, not guessed) -- but live-verified against a real
+# UHF-R during actual singing: normal vocal level peaks around raw 20-30,
+# only ~8-12% on a flat linear 0-255-to-100% mapping. That's accurate data
+# (the raw capture clearly shows a real rising-and-falling envelope in sync
+# with the singing), but a linear bar makes completely normal input look
+# like it's barely registering, when a real meter -- including this
+# receiver's own front-panel LEDs -- is logarithmic, like every audio
+# meter, to give useful visual resolution to typical speech/singing levels
+# rather than only the rarely-hit top few dB near clipping. Unlike
+# PSM1000's AUDIO_IN_LVL (genuinely undocumented, open-ended), 255 here is
+# a real documented full-scale reference, so this converts to dBFS against
+# it properly rather than guessing a curve.
+UHFR_AUDIO_DB_FLOOR = -40  # dBFS; at/below this reads 0%
+
+def _uhfr_audio_pct(raw):
+    if raw <= 0:
+        return 0
+    dbfs = 20 * math.log10(raw / 255)
+    pct = (dbfs - UHFR_AUDIO_DB_FLOOR) / (0 - UHFR_AUDIO_DB_FLOOR) * 100
+    return max(0, min(100, round(pct)))
+
 class UHFRProvider(BaseProvider):
     def __init__(self, ip, device_type, photo=None, channel=1):
         super().__init__(ip, device_type, photo)
@@ -502,7 +524,7 @@ class UHFRProvider(BaseProvider):
                 else:
                     quality = max(0, 100 - strongest)
                 self.metrics['rf'] = quality
-                self.metrics['audio'] = round(audio_raw / 255 * 100)
+                self.metrics['audio'] = _uhfr_audio_pct(audio_raw)
                 continue
             if parts[0] != 'REPORT' or len(parts) < 2:
                 continue
