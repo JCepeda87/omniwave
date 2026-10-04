@@ -176,6 +176,9 @@ def init_db():
     for col, col_type in METRIC_SCHEMA.items():
         if col not in existing_cols:
             conn.execute(f'ALTER TABLE metrics ADD COLUMN {col} {col_type}')
+    # Speeds both prune_old_metrics()'s DELETE and SnapshotHandler's SELECT,
+    # both filtering on timestamp alone.
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp)')
     conn.commit()
     conn.close()
 
@@ -203,6 +206,47 @@ def log_metrics(ip, metrics):
     conn.execute(f'INSERT INTO metrics ({",".join(cols)}) VALUES ({placeholders})', values)
     conn.commit()
     conn.close()
+
+# No pruning ever existed before this -- confirmed live this session:
+# 122MB, 2.6 million rows, dating back to the first time this app was ever
+# run (Sept 11), growing unbounded at roughly 2 rows/sec/connected device
+# (one poll_devices() cycle every 0.5s). 7 days keeps a real, useful window
+# for troubleshooting while bounding growth -- the Instant Replay feature
+# itself only ever looks back 30 minutes, so this is deliberately far more
+# generous than the replay UI needs.
+METRICS_RETENTION_DAYS = 7
+METRICS_PRUNE_INTERVAL_SECONDS = 3600  # hourly
+
+def prune_old_metrics():
+    """Blocking; call via run_in_executor -- the first run after this
+    shipped deletes millions of rows, which can take real wall-clock time
+    and must never block the IOLoop. SQLite doesn't shrink the file on
+    DELETE alone (confirmed: deleting 1.5M of 2.6M rows left the file
+    *larger*, from WAL/journal overhead, until VACUUMed down from 195MB to
+    80MB) -- VACUUM only when something was actually deleted, since it
+    rewrites the whole file and there's no point paying that cost on an
+    empty prune (most of the hourly runs, once the initial backlog is
+    cleared)."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute(
+        "DELETE FROM metrics WHERE timestamp < datetime('now', ?)",
+        (f'-{METRICS_RETENTION_DAYS} days',),
+    )
+    deleted = cursor.rowcount
+    conn.commit()
+    if deleted:
+        conn.execute('VACUUM')
+    conn.close()
+    return deleted
+
+async def prune_metrics_tick():
+    try:
+        deleted = await IOLoop.current().run_in_executor(None, prune_old_metrics)
+        if deleted:
+            print(f"Pruned {deleted} metrics row(s) older than {METRICS_RETENTION_DAYS} days")
+    except Exception as e:
+        print(f"Metrics pruning failed: {e}")
+    IOLoop.current().call_later(METRICS_PRUNE_INTERVAL_SECONDS, lambda: IOLoop.current().spawn_callback(prune_metrics_tick))
 
 def send_webhook(message):
     webhook_url = "https://hooks.slack.com/services/T000/B000/XXXX" 
@@ -273,6 +317,36 @@ class AnalyticsHandler(RequestHandler):
         data = cursor.fetchall()
         conn.close()
         self.write(json.dumps(data))
+
+class SnapshotHandler(RequestHandler):
+    """Instant Replay: every device's most-recent metrics row at or before
+    a given moment, in one query -- not per-device like AnalyticsHandler,
+    since the whole board needs to time-travel together. Relies on a real,
+    documented SQLite behavior (not a trick): when MAX() is the only
+    aggregate in the result list, SQLite guarantees the non-aggregated
+    columns come from the same row that produced the max, so one GROUP BY
+    query is enough instead of N "latest row per device" lookups."""
+    def get(self):
+        t = self.get_argument('t', None)
+        try:
+            t = float(t)
+        except (TypeError, ValueError):
+            self.set_status(400)
+            self.write(json.dumps({'error': 't (unix seconds) is required'}))
+            return
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT ip, batt, rf, audio, MAX(timestamp) FROM metrics "
+            "WHERE timestamp <= datetime(?, 'unixepoch') GROUP BY ip",
+            (t,),
+        ).fetchall()
+        conn.close()
+        snapshot = {
+            key: {'batt': batt, 'rf': rf, 'audio': audio, 'timestamp': ts}
+            for key, batt, rf, audio, ts in rows
+        }
+        self.set_header('Content-Type', 'application/json')
+        self.write(json.dumps(snapshot))
 
 class CommandHandler(RequestHandler):
     async def post(self):
@@ -1768,6 +1842,7 @@ def main():
         (r'/user', UserIndexHandler),
         (r'/data', DataHandler),
         (r'/analytics', AnalyticsHandler),
+        (r'/analytics/snapshot', SnapshotHandler),
         (r'/command', CommandHandler),
         (r'/scan', ScanHandler),
         (r'/listen/(.+)', ListenHandler),
@@ -1803,6 +1878,7 @@ def main():
     _sap_listener.start()
     IOLoop.current().spawn_callback(poll_devices)
     IOLoop.current().spawn_callback(auto_discovery_tick)
+    IOLoop.current().spawn_callback(prune_metrics_tick)
     print(f"OmniWave OS v{VERSION} running on 0.0.0.0:9000...")
     IOLoop.current().start()
 

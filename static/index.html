@@ -63,6 +63,16 @@
     background: var(--panel); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 4px 8px; font-size: 13px;
   }
+  .replay-bar {
+    display: flex; align-items: center; gap: 10px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px;
+    margin-bottom: 20px; font-size: 13px;
+  }
+  .replay-bar.active { border-color: var(--warn); background: var(--warn-dim); }
+  .replay-live-badge { color: var(--ok); font-weight: 700; font-size: 11px; letter-spacing: .03em; white-space: nowrap; }
+  .replay-bar.active .replay-live-badge { color: var(--muted); }
+  .replay-label { color: var(--warn); font-weight: 700; min-width: 150px; }
+  .replay-bar input[type="range"] { flex: 1; accent-color: var(--accent); }
   .stats { display: flex; gap: 10px; flex-wrap: wrap; }
   .stat {
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
@@ -306,6 +316,15 @@
       <div class="stat"><div class="stat-val" id="statUpdated">—</div><div class="stat-label">Updated</div></div>
       <a href="/user" style="align-self:center; color:var(--muted); text-decoration:none; font-size:13px; border:1px solid var(--border); border-radius:8px; padding:8px 14px;">👤 User Board</a>
     </div>
+  </div>
+
+  <div class="replay-bar" id="replayBar">
+    <span class="replay-live-badge" id="replayLiveBadge">● LIVE</span>
+    <span class="replay-label" id="replayLabel"></span>
+    <input type="range" id="replaySlider" min="0" max="1800" value="1800" step="5"
+           oninput="onReplayInput(this.value)" title="Scrub back up to 30 minutes">
+    <span class="device-meta">30 min ago</span>
+    <button class="secondary" id="replayLiveBtn" onclick="returnToLive()" style="display:none">Return to Live</button>
   </div>
 
   <div class="panel">
@@ -1052,7 +1071,80 @@ function renderLayoutBoard(data) {
 
 let lastData = {};
 
+// --- Instant Replay -----------------------------------------------------
+// Metrics-only replay (batt/rf/audio over the last 30 min), not true audio
+// playback -- that still depends on the unresolved AES67/Dante network
+// access (see aes67.py / the Listen feature). Device identity/alerts/etc.
+// freeze as of the moment replay starts; only the metrics shown actually
+// time-travel, by merging a point-in-time snapshot from
+// GET /analytics/snapshot over the frozen live data -- renderDevices()/
+// renderRfPlot() need no changes at all, they already just render
+// whatever .metrics they're handed.
+let replayOffsetSeconds = 0;   // 0 = live
+let replaySnapshot = null;
+let frozenLiveData = null;     // lastData as of the moment replay was entered
+let replayDebounceTimer = null;
+
+function mergeReplaySnapshot(baseData, snapshot) {
+  const merged = {};
+  for (const key of Object.keys(baseData)) {
+    const s = snapshot[key];
+    merged[key] = Object.assign({}, baseData[key], {
+      metrics: s ? { batt: s.batt, rf: s.rf, audio: s.audio } : {},
+    });
+  }
+  return merged;
+}
+
+function renderReplayView() {
+  const merged = mergeReplaySnapshot(frozenLiveData || lastData, replaySnapshot || {});
+  renderStats(merged);
+  renderAlertsFeed(merged);
+  renderRfPlot(merged);
+  if (editingName.size === 0 && editingFreq.size === 0 && streamConfigOpen.size === 0) {
+    renderDevices(merged);
+  }
+}
+
+async function onReplayInput(sliderValue) {
+  const offset = 1800 - parseInt(sliderValue, 10);
+  if (offset <= 0) { returnToLive(); return; }
+  replayOffsetSeconds = offset;
+  if (!frozenLiveData) frozenLiveData = lastData;
+
+  document.getElementById('replayBar').classList.add('active');
+  document.getElementById('replayLiveBtn').style.display = '';
+  document.getElementById('replayLiveBadge').textContent = '⏪ REPLAY';
+  const t = Math.floor(Date.now() / 1000) - offset;
+  document.getElementById('replayLabel').textContent = new Date(t * 1000).toLocaleTimeString();
+
+  clearTimeout(replayDebounceTimer);
+  replayDebounceTimer = setTimeout(async () => {
+    try {
+      replaySnapshot = await fetch('/analytics/snapshot?t=' + t).then(r => r.json());
+    } catch (e) { replaySnapshot = {}; }
+    renderReplayView();
+  }, 150);
+}
+
+function returnToLive() {
+  replayOffsetSeconds = 0;
+  replaySnapshot = null;
+  frozenLiveData = null;
+  clearTimeout(replayDebounceTimer);
+  document.getElementById('replaySlider').value = 1800;
+  document.getElementById('replayBar').classList.remove('active');
+  document.getElementById('replayLiveBtn').style.display = 'none';
+  document.getElementById('replayLiveBadge').textContent = '● LIVE';
+  document.getElementById('replayLabel').textContent = '';
+  refresh();
+}
+
 async function refresh() {
+  if (replayOffsetSeconds > 0) {
+    renderReplayView();
+    return;
+  }
   let data;
   try {
     data = await fetch('/data').then(r => r.json());
