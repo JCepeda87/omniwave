@@ -1587,8 +1587,24 @@ class ScanExclusionsHandler(RequestHandler):
 _last_webhook_sent = {}
 WEBHOOK_COOLDOWN_SECONDS = 60
 
+# Every provider's poll() flips itself to DISCONNECTED after a run of missed
+# polls (see providers.py's NETWORK_MISS_LIMIT/UHFR_MISS_LIMIT), but nothing
+# ever called connect() again afterward -- a device that drops out from a
+# transient network blip (a laptop's Wi-Fi hiccupping mid-service, say) and
+# then recovers on its own stayed stuck showing offline until someone
+# switched locations or restarted the server, even though the hardware was
+# reachable again. Retrying connect() here, throttled so a genuinely
+# powered-off device isn't hammered, lets it come back automatically.
+RECONNECT_RETRY_SECONDS = 5
+_last_reconnect_attempt = {}
+
 async def _poll_one_device(ip, dev):
     try:
+        if dev.status != 'CONNECTED':
+            now = time.time()
+            if now - _last_reconnect_attempt.get(ip, 0) >= RECONNECT_RETRY_SECONDS:
+                _last_reconnect_attempt[ip] = now
+                await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.connect)
         await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.poll)
         log_metrics(ip, dev.metrics)
         batt = dev.metrics.get('batt')
