@@ -1,255 +1,229 @@
 # OmniWave — Handover
 
-Last updated: 2026-10-02. Written for whoever picks this project up next.
+Last updated: 2026-10-02 (second revision, by Zac Beckenham, on taking the project over from
+Julian Cepeda). This revision corrects places where the first version had fallen behind the
+code, and adds setup steps for a fresh Mac. The original text is still in `omniwave-main.zip`
+if you need it.
 
-## Status: everything below is committed and pushed
+## Status
 
-Commits `d2d51a8`..`23f8580` on `main`, already on `origin` — a normal `git clone` or
-`git pull` gets you all of it. (For a while during this work, `git` itself was broken on
-the original dev machine — an unaccepted Xcode license was blocking `git`, `python3`, and
-`brew` all at once. That's resolved and was specific to that one Mac; see "Environment"
-below before assuming any of that applies to your own setup.)
+- Source of truth: `https://github.com/JCepeda87/omniwave`, branch `main`. Verified
+  2026-10-02: the latest commit is `4dce76b` ("Clarify HANDOVER.md..."), and every source file
+  in the `omniwave-main` zip matches that commit exactly. The only local differences are this
+  revised `HANDOVER.md` and the updated `.claude/launch.json`. Zac now has collaborator
+  access to the repo.
+- Smoke-tested 2026-10-02 against this copy, in a Linux environment rather than macOS: all
+  modules import, the server starts on `0.0.0.0:9000`, and `/`, `/user`, `/data` and
+  `/regions` all respond. The `ifconfig` subnet parser was checked against sample macOS
+  output and is correct. Nothing was tested against real hardware in this round.
 
 ## What this is
 
 A self-hosted dashboard for monitoring Shure/Sennheiser wireless mic and IEM systems on a
-local network — real protocol integration against each device's own control protocol, not
-mocked data. Two views: `/` (admin — add/configure/discover devices) and `/user` (read-mostly
-stage-facing board). See [README.md](README.md) for the user-facing pitch; this doc is about
-what's actually running under the hood and what's half-finished.
+local network. It speaks each device's own control protocol for real; nothing is mocked. It
+has two views: `/` (admin: add, configure and discover devices) and `/user` (a read-mostly
+board for the stage). See [README.md](README.md) for the user-facing summary. This doc covers
+how it works under the hood and what's half-finished.
 
-## Environment: how to actually run this
+## Environment: running it on a Mac
 
-**Normal setup, on a normal machine:**
+**macOS only, in practice.** Discovery shells out to `ifconfig` and `dns-sd`, both
+macOS-specific. On other platforms the server starts and the UI loads, but subnet detection
+returns nothing and mDNS discovery doesn't work.
+
+Dependencies: just `tornado` and `requests` (see `requirements.txt`). **`netifaces` is gone.**
+The first handover described it at length, but `get_local_subnets()` now parses `ifconfig`
+output directly, so none of the old netifaces fallback or "degraded multi-subnet" caveats
+apply any more.
+
+### First-time setup (fresh Mac)
 
 ```bash
-git clone https://github.com/JCepeda87/omniwave.git
-cd omniwave
-python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+cd ~/Documents/omniwave-main
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
 ./venv/bin/python3 omniwave.py
 ```
 
-Three small, pure-Python dependencies (`tornado`, `requests`, `netifaces`) — this should
-just work on any normal Python 3.8+ install with pip/network access. The rest of this
-section only applies if you hit the *exact* symptom below; otherwise skip it.
+Then open `http://localhost:9000` (admin) or `http://localhost:9000/user`.
 
----
+- If `python3` asks you to install the Command Line Developer Tools, accept and re-run.
+- On a Hillsong-managed Mac that install can fail with "not currently available from the
+  Software Update server". If it does, install Python from python.org instead and use
+  `/usr/local/bin/python3 -m venv venv`. This is how Zac's machine was set up.
+- If you see `"You have not agreed to the Xcode license agreements..."`, run
+  `sudo xcodebuild -license accept` once. That error blocked `git`, `python3` and `brew` all
+  at once on the original dev machine.
+- **Run it from the project folder.** `config.json` and `omniwave_history.db` are opened by
+  relative path, so they're created in whatever directory you launch from.
+- The first launch may trigger a macOS "allow incoming connections" firewall prompt for
+  Python. Allow it if other devices need to reach the board.
 
-**What follows is specific to the original dev machine**, which had a broken Xcode
-Command Line Tools license that silently blocked `git`, `python3`, *and* `brew` all at
-once (`"You have not agreed to the Xcode license agreements..."`). If you ever see that
-exact error on a Mac, `sudo xcodebuild -license accept` (interactive terminal + password)
-fixes it at the root — cheaper than any of the workarounds below. Only if that's not an
-option did this project end up with:
+### `.claude/launch.json` (preview tooling)
 
-- `/usr/bin/python3` and the project's own `venv/bin/python3` (a symlink into
-  `/Applications/Xcode.app/.../Python3.framework/...`) both route through the same
-  Xcode-license gate as git above. They work fine from an interactive shell once the
-  license is accepted, but failed outright before that — and even after accepting the
-  license, `venv/bin/python3` specifically fails under the **preview-server launcher's
-  sandbox** (`.claude` tooling), with a permission error reading `venv/pyvenv.cfg` — a
-  sandbox restriction unrelated to the license, confirmed by testing the exact same
-  interpreter successfully from an interactive Bash shell.
-- The working fix, already wired into **`.claude/launch.json`**: it points at
-  `/opt/homebrew/bin/python3` (an independent Homebrew interpreter, not gated by any of
-  the above). That interpreter's site-packages has `tornado`, `requests`, `certifi`,
-  `charset_normalizer`, `idna`, and `urllib3` copied in directly (network was down at the
-  time, so `pip install` wasn't an option — they were copied from the working `venv`'s
-  site-packages instead, since they're pure Python / stable-ABI and load fine under a
-  different CPython version).
-- **`netifaces` is the one exception** — it's a compiled C extension pinned to the old
-  venv's Python 3.9 ABI, and does not load under the Homebrew interpreter's Python 3.14.
-  `omniwave.py`'s `import netifaces` is now wrapped in a `try/except ImportError`
-  (`netifaces = None` on failure), and `get_local_subnets()` has a real fallback: when
-  `netifaces` is unavailable, it falls back to the old single-subnet heuristic (reflects
-  only the default-route interface) instead of hard-crashing. **Multi-subnet discovery is
-  degraded under the Homebrew interpreter specifically** — if you want full netifaces
-  support back, either `./venv/bin/python3 -m pip install -r requirements.txt` and run
-  with that interpreter directly (works fine interactively, just not through the preview
-  sandbox), or `/opt/homebrew/bin/python3 -m pip install netifaces` once network access
-  and the Xcode license are sorted (untested whether it'll build cleanly there).
-- Practical recommendation once git/Xcode is sorted: rebuild a clean venv from
-  `/opt/homebrew/bin/python3 -m venv venv && ./venv/bin/pip install -r requirements.txt`,
-  point `launch.json` back at `venv/bin/python3`, and retest whether the sandbox issue
-  above still reproduces — it may have been specific to the venv being built from the
-  Xcode interpreter rather than venvs in general. Nobody's verified this yet.
-- To run manually without the preview tooling: `./venv/bin/python3 omniwave.py` (full
-  netifaces support, Xcode-license-gated) or `/opt/homebrew/bin/python3 omniwave.py`
-  (works everywhere, degraded subnet detection). Server listens on `0.0.0.0:9000`.
+This file was hard-coded to the original dev machine: `/Users/julian.cepeda/...` and a
+Homebrew interpreter with hand-copied site-packages. On 2026-10-02 it was repointed to
+`/Users/zachary.beckenham/Documents/omniwave-main/venv/bin/python3`, with `cwd` set to the
+project folder. Anyone else taking it over will need to change these paths to match their
+own machine.
+
+The original machine had an unexplained problem: the preview sandbox couldn't read
+`venv/pyvenv.cfg`. That venv was built from the Xcode-bundled Python. Nobody knows yet whether
+a venv built from a normal Python hits the same thing. If it does, run the server from
+Terminal instead (commands above).
 
 ## Architecture
 
-- **`omniwave.py`** — Tornado server: all HTTP/WebSocket handlers, device registry
-  (`Devices`, `DeviceNames`, `DeviceFrequencies`, `DeviceLayout`, etc., all keyed by
-  `device_key(ip, channel)` — composite key, *not* bare IP, because multi-channel units
-  like a ULXD4Q or dual PSM1000 need one entry per channel), the polling loop
-  (`poll_devices()`), and all network discovery (subnet detection, port scanning, mDNS,
-  SAP). `main()` loads `config.json` on startup and reconnects every saved device.
-- **`providers.py`** — one class per device family, all subclassing `BaseProvider`
-  (`connect`/`disconnect`/`poll`/`scan_rf`/`send_command`/`get_json`). Real protocol
-  implementations only — `identify_device()` in omniwave.py never guesses a model from
-  which port happened to answer; it speaks each protocol enough to get a real answer.
-  See each provider's module-level comment for exactly what's hardware-verified vs.
-  "implemented from the published spec, never tested against real hardware."
-- **`aes67.py`** — the real-time "Listen" feature (phase 1 only — see below).
-- **`static/index.html`** — admin dashboard (vanilla JS, no build step, no framework).
-- **`static/user.html`** — read-mostly stage board.
-- **`config.json`** — runtime device state, gitignored, not source. Deleting it is safe;
-  Auto-Discovery (on by default — see below) will repopulate anything it can identify.
-- **`omniwave_history.db`** — SQLite metrics history (batt/rf/audio over time), **74MB and
-  growing**. Already gitignored — just worth knowing it's there and will keep growing
-  unbounded; nothing currently prunes old rows.
-- **`micboard_modern.py`**, **`spectrum_planner.py`** — supporting modules (frequency
-  coordination / RF scan planning). Not touched this round; not covered in depth here.
+- **`omniwave.py`**: the Tornado server. It holds all HTTP/WebSocket handlers, the device
+  registry (`Devices`, `DeviceNames`, `DeviceFrequencies`, `DeviceLayout`, etc.), the polling
+  loop (`poll_devices()`), and all network discovery (subnet detection, port scanning, mDNS,
+  SAP). The registry is keyed by `device_key(ip, channel)`, a composite key rather than the
+  bare IP, because multi-channel units like a ULXD4Q or a dual PSM1000 need one entry per
+  channel. On startup, `main()` loads `config.json` and reconnects every saved device.
+- **`providers.py`**: one class per device family, each subclassing `BaseProvider`
+  (`connect`/`disconnect`/`poll`/`scan_rf`/`send_command`/`get_json`). These are real protocol
+  implementations only: `identify_device()` in omniwave.py speaks each protocol enough to get
+  a real answer, and never guesses the model from which port happened to answer. Each
+  provider's module-level comment says which parts are hardware-verified and which were built
+  from the spec but never tested on real hardware.
+- **`aes67.py`**: the real-time "Listen" feature (phase 1 only, see below).
+- **`static/index.html`**: the admin dashboard (vanilla JS, no build step, no framework).
+- **`static/user.html`**: the read-mostly stage board.
+- **`spectrum_planner.py`**: RF regions (`us_fcc`, `eu_etsi`, `au_acma`) and frequency
+  coordination. The ACMA entry covers 520–694 MHz and tells users to check ACMA's Channel
+  Finder before deploying.
+- **`micboard_modern.py`**: a supporting module, not reviewed in depth.
+- **`config.json`**: runtime device state, gitignored and not source. It's safe to delete;
+  Auto-Discovery will repopulate anything it can identify.
+- **`omniwave_history.db`**: SQLite metrics history (battery, RF and audio over time). It was
+  **74MB and growing** on the original machine. Nothing prunes old rows.
 
-## Device/provider model — key concepts
+### Security posture (read before using on a shared network)
 
-- **Composite keying**: `device_key(ip, channel)` everywhere. A quad ULXD4Q at one IP
-  becomes 4 separate `Devices` entries. `discover_channels()` queries each protocol family
-  for its *real* channel count rather than guessing from a model-name suffix.
-- **Role** (`transmitter` vs `receiver`): `device_role(dtype)` in omniwave.py, driven by
-  `TRANSMITTER_TYPES`. IEM transmitters (PSM1000/900/300, XSW-IEM, the new
-  `sennheiser-g4-sr`) send audio *out*; everything else is a receiver.
-- **`freq_unavailable_reason`**: distinguishes "this protocol structurally can't report a
-  frequency" (e.g. PSM1000's one-way push protocol) from "nobody's assigned one yet" — the
-  UI shows the real reason instead of a misleading blank.
-- **`dante_status`**: confirmed-live (not guessed) Dante-interface detection, per brand:
-  - Sennheiser: `SennheiserSSCProvider` queries `/device/network/ether/interfaces` +
+- The server binds to `0.0.0.0:9000` and has **no authentication on any endpoint** except
+  `/system/update`. That means anyone on the same network can open `/` and mute or unmute
+  devices, change frequencies, rename devices and trigger scans.
+- `/system/update` (OTA `git pull`) is disabled unless `OMNIWAVE_OTA_TOKEN` is set, and it
+  compares tokens with `hmac.compare_digest`.
+- Discovery actively port-scans and runs mDNS browses across every subnet it detects.
+- **Policy:** this tool talks to real devices on Hillsong campus networks. Under Hillsong's
+  IT/AI policies it must be reviewed by Hillsong IT before it's used against production
+  systems or handed to anyone else. Raise this with the venue network team at the same time
+  as the EM 6000 allow-listing (see below).
+
+## Device/provider model: key concepts
+
+- **Composite keying**: `device_key(ip, channel)` is used everywhere. A quad ULXD4Q at one IP
+  becomes 4 separate `Devices` entries. `discover_channels()` asks each protocol family for
+  its real channel count rather than guessing from a model-name suffix.
+- **Role** (`transmitter` vs `receiver`): set by `device_role(dtype)`, driven by
+  `TRANSMITTER_TYPES`. IEM transmitters (PSM1000/900/300, XSW-IEM, `sennheiser-g4-sr`) send
+  audio out; everything else is a receiver.
+- **`freq_unavailable_reason`**: separates "this protocol can't report a frequency at all"
+  (e.g. PSM1000's one-way push protocol) from "nobody has assigned one yet", so the UI shows
+  the real reason instead of a blank.
+- **`dante_status`**: Dante interfaces are detected by querying the device, never guessed:
+  - Sennheiser: `SennheiserSSCProvider` queries `/device/network/ether/interfaces` and
     `/device/network/ipv4_dante/{auto,ipaddr}` once at connect.
-  - Shure: `ShureProvider`/`AxientDigitalProvider` query the real `NA_DEVICE_NAME` command
-    string (confirmed against Shure's own ULX-D command-strings spec) once at connect.
-    Deliberately **not** added to SLX-D (no Dante in its published command set), UHF-R
-    (predates Dante), PSM1000 (one-way protocol, no query channel at all), or MXW (no
-    Dante hardware).
-  - `None` means "not yet queried" (e.g. currently unreachable) — never conflated with
-    "confirmed absent." The admin UI's "Show Dante-confirmed devices only" checkbox
-    filters on this.
+  - Shure: `ShureProvider`/`AxientDigitalProvider` query `NA_DEVICE_NAME` (taken from Shure's
+    ULX-D command-strings spec) once at connect. Deliberately not added to SLX-D, UHF-R,
+    PSM1000 or MXW, because none of them expose Dante over their control protocol.
+  - `None` means "not yet queried" (for example, the device is unreachable right now), which
+    is different from "confirmed absent". The admin UI's "Show Dante-confirmed devices only"
+    filter uses this field.
 
-## Discovery — why there are four different mechanisms
+## Discovery: why there are four mechanisms
 
-This machine moves between venues and networks constantly, and this was the dominant
-theme of the most recent work. Four complementary discovery paths, each covering a gap the
-others can't:
+The original laptop moved between venues and networks constantly, so discovery is layered:
 
-1. **`get_local_subnets()`** — dynamic, re-detects every currently-active interface
-   subnet on every call (no hardcoded assumptions). Caps anything bigger than `/24` down
-   to the `/24` containing this machine's own address (a `/16` corporate network would
-   otherwise mean tens of thousands of probes). **Known gap**: if the real devices live in
-   a *different* `/24` within a larger detected network, this won't see them — no fix
-   shipped for that yet, just documented in the admin UI copy.
-2. **Active port scanning** (`scan_subnet`/`scan_subnet_udp`) — TCP 2202 (Shure), TCP+UDP
-   45 (Sennheiser SSC — UDP is the mandatory transport per Sennheiser's own spec, TCP is
-   optional and some product lines, Digital 6000 included, don't implement it at all; this
-   was a real bug fixed this round), UDP 53212 (Sennheiser G3/G4 "Media control protocol"),
-   UDP 2202 (UHF-R).
-3. **mDNS/Bonjour** (`mdns_discover_sennheiser_ips()`) — browses `_ssc._udp`/`_ssc._tcp`
-   via the macOS `dns-sd` CLI. **This is the important one**: confirmed live this session
-   that several real Sennheiser EM 6000 units announce themselves via Bonjour but never
-   answer a single direct unicast query on any port (full port scan came back empty) — a
-   venue network/switch policy blocking unicast to an unrecognized client, not a device
-   problem. mDNS still finds them, so they at least surface in Scan Network results with
-   an honest "can't reach it directly" label instead of vanishing entirely. Caught a real
-   Python 3.9 bug along the way: `subprocess.TimeoutExpired.stdout` comes back as **bytes**
-   even with `text=True` passed to `subprocess.run()` — every real `dns-sd` call hits the
-   timeout path (it runs forever), so this would have silently broken all parsing if not
-   caught and decoded explicitly.
-4. **`Probe IP`** (admin UI) / `POST /discover/probe` — type in a specific address and it's
-   checked directly, completely bypassing subnet detection. For when a device is on a
-   segment this machine hasn't auto-detected, or the full-subnet scan's `/24` cap is
-   hiding it.
+1. **`get_local_subnets()`**: re-detects every active interface subnet by parsing
+   `ifconfig` on every call. It caps anything bigger than `/24` down to the `/24` that
+   contains this machine's own address. **Known gap**: devices in a different `/24` inside a
+   larger network won't be found. Use Probe IP for those.
+2. **Active port scanning** (`scan_subnet`/`scan_subnet_udp`):
+   - TCP 2202 (Shure)
+   - TCP and UDP 45 (Sennheiser SSC). UDP is the mandatory transport; Digital 6000 has no
+     TCP at all.
+   - UDP 53212 (Sennheiser G3/G4 Media control protocol)
+   - UDP 2202 (UHF-R)
+3. **mDNS/Bonjour** (`mdns_discover_sennheiser_ips()`): browses `_ssc._udp`/`_ssc._tcp`
+   using the macOS `dns-sd` CLI. This finds Sennheiser units that a venue's switch policy
+   blocks from answering unicast. Note: `subprocess.TimeoutExpired.stdout` comes back as
+   bytes even with `text=True`, and every `dns-sd` call ends on the timeout path, so the code
+   decodes it explicitly.
+4. **Probe IP** (admin UI) / `POST /discover/probe`: checks one specific address directly,
+   bypassing subnet detection entirely.
 
-**Auto-Discovery now defaults to ON** (`AUTO_DISCOVERY_ENABLED = True`, 20s interval) —
-previously defaulted off and reset every restart, which fought directly against "just work
-on whatever network I'm on," especially given how often this app has needed restarting
-during active development. Still toggleable off in the admin UI.
+**Auto-Discovery is on by default** (`AUTO_DISCOVERY_ENABLED = True`, every 20s), and can be
+switched off in the admin UI.
 
-## AES67 "Listen" feature — phase 1 only
+## AES67 "Listen" feature: phase 1 only
 
-Real plan on file at `~/.claude/plans/moonlit-wibbling-donut.md` (or ask the repo owner —
-it may not survive a machine change). Summary of what's actually built vs. deliberately
-deferred:
+The detailed plan lived at `~/.claude/plans/moonlit-wibbling-donut.md` on the original
+machine and **did not come across with the zip**. Ask Julian for it if you need it.
 
-**Built** (`aes67.py` + `ListenHandler`/listen-stream config in `omniwave.py` + a
-"🎧 Listen" button and "Configure Listen Stream" UI in `index.html`):
-- SDP parsing, RTP packet parsing (12-byte header, L16/L24 big-endian PCM — no codec
-  needed, AES67 is uncompressed), a jitter buffer, SAP listener (multicast
-  `224.2.127.254:9875`) for discovering available AES67 streams.
-- A WebSocket bridge (`tornado.websocket.WebSocketHandler`) streaming decoded PCM to the
-  browser, played back via the native WebAudio API — no new JS dependency.
-- Manual multicast-address/SDP entry as a fallback when SAP/discovery doesn't surface a
-  stream (same "don't guess, offer an honest manual path" pattern as the rest of the app).
-- **Deliberately scoped to AES67 only, not native Dante** — Dante's own wire protocol
-  needs an Audinate OEM SDK license to implement; AES67 is the open, license-free standard
-  Dante hardware can also speak once "AES67 mode" is turned on per-device in Dante
-  Controller (a normal Audinate-supported feature, not a hack). That toggle is venue-side,
-  in Dante Controller — this app has no way to flip it remotely.
-- No PTP client — deliberate simplification. Fine for "listen to one stream as it
-  arrives"; would matter for sample-accurate multi-channel sync (Instant Replay, below).
+**Built** (`aes67.py`, `ListenHandler`/listen-stream config in `omniwave.py`, and the
+"🎧 Listen" button plus "Configure Listen Stream" UI in `index.html`):
 
-**Explicitly NOT built** (all discussed with the project owner, deferred on purpose, not
-forgotten):
-- **Instant Replay** (30-min rolling multi-channel buffer) — real storage design question
-  (~170MB/channel/30min uncompressed PCM) that needs its own plan.
-- **"Intelligent" mic issue detection** beyond the threshold-based red-alert highlighting
-  already in the UI — genuine DSP/ML work, not a small addition.
-- **Multi-user chat/collaboration** (images, reactions, voice notes) — independent of the
-  audio work entirely, can be scoped separately any time.
+- SDP parsing, RTP parsing (L16/L24 big-endian PCM), a jitter buffer, and a SAP listener
+  (`224.2.127.254:9875`).
+- A WebSocket bridge that streams PCM to the browser, played back with WebAudio.
+- Manual multicast/SDP entry as a fallback.
+- AES67 only, not native Dante. Dante's wire protocol needs an Audinate OEM SDK licence.
+  Dante devices must have AES67 mode turned on in Dante Controller, which happens on the
+  venue side.
+- No PTP client. That's fine for listening to one stream; it would matter for sample-accurate
+  multi-channel sync.
 
-**Unverified against real audio**: the venue network access needed to actually receive
-live AES67 multicast audio was never confirmed working — same class of restriction as the
-EM 6000 control-plane issue (see below). The code's correctness was verified with
-synthetic/loopback tests, not live venue audio.
+**Deliberately not built:** Instant Replay (needs its own storage design, roughly
+170MB/channel/30min), "intelligent" mic issue detection beyond threshold alerts, and
+multi-user chat/collaboration.
 
-## Real-world network findings (tribal knowledge, not in any code comment)
+**Unverified against real audio.** It has only been tested with synthetic and loopback data.
 
-- This is a working venue network (confirmed to be a Hillsong campus earlier in the
-  project, via a Dante Domain Manager hostname found during mDNS reconnaissance) — **not**
-  a lab. Expect switch/VLAN policy, not just flaky Wi-Fi.
-- Several real Sennheiser EM 6000 units are on the network, alive and correctly
-  configured (Remote Control + Online Mode both confirmed on, by the venue's own staff),
-  confirmed reachable via a working Dante Controller session from a *different* PC on the
-  same network — but this laptop specifically cannot reach them on any port. That's a
-  switch/VLAN access-control decision on the venue's side. **Nothing in this codebase can
-  fix that** — it needs this laptop's MAC/IP allow-listed by whoever manages the venue
-  network. Don't spend more engineering time trying to route around it; it's been tried
-  thoroughly (full port scans, every known protocol, local firewall ruled out).
-- The laptop's own network state changes **constantly** and unpredictably during a single
-  working session — different adapters (`en0` Wi-Fi vs `en10` a USB-Ethernet dongle) pick
-  up completely different subnets, sometimes link-local (`169.254.x.x`, no DHCP server
-  present), sometimes routed, sometimes direct, and it can flip between these within
-  minutes. This is *why* discovery had to become this layered — don't assume the network
-  picture from an hour ago is still true.
+## Real-world network findings
 
-## What changed this round (for splitting into commits)
+- The network is a working Hillsong campus network, not a lab, so expect switch and VLAN
+  policy.
+- Several Sennheiser EM 6000 units are alive and correctly configured, and they're reachable
+  from another PC running Dante Controller. The original laptop couldn't reach them on any
+  port. That's a venue access-control decision: **it needs the laptop's MAC/IP allow-listed
+  by whoever manages the venue network**, and no code change will fix it. Under the new
+  owner this will be a different laptop, so the allow-listing request needs this machine's
+  details.
+- A laptop's network state can change within minutes: different adapters, link-local
+  `169.254.x.x` addresses, routed vs. direct connections. Don't trust the network picture
+  from an hour ago.
 
-Roughly in dependency order:
-1. Multi-channel device support (composite `device_key`), transmitter/receiver roles,
-   `freq_unavailable_reason` honesty pattern.
+## History of changes (Julian's last round)
+
+1. Multi-channel device support (composite `device_key`), transmitter/receiver roles, and
+   `freq_unavailable_reason`.
 2. User Board per-device visibility toggle.
-3. Battery-as-runtime + alert-banner UI (WaveTool-inspired, protocol-verified).
-4. Sennheiser G3/G4 "Media control protocol" provider (`SennheiserG4Provider`, UDP 53212) —
-   net-new protocol support, including the EM vs SR disambiguation via a live `Squelch`
-   probe.
-5. `Probe IP` manual single-address discovery endpoint + UI.
-6. mDNS/Bonjour discovery layer + the `TimeoutExpired.stdout`-is-bytes fix.
-7. SSC transport fix: UDP instead of TCP-only (fixes Digital 6000/EM 6000 specifically).
-8. `dante_status` detection for both brands + the "Dante-confirmed only" filter.
-9. AES67 Listen feature (`aes67.py` + handlers + UI) — see plan file for full detail.
-10. Auto-Discovery defaults to on.
-11. `netifaces` graceful-degradation fallback + the Homebrew-interpreter environment fix
-    (`.claude/launch.json`).
+3. Battery-as-runtime and alert-banner UI.
+4. Sennheiser G3/G4 Media control protocol provider (`SennheiserG4Provider`, UDP 53212),
+   including the EM vs SR disambiguation.
+5. Probe IP endpoint and UI.
+6. mDNS/Bonjour discovery and the `TimeoutExpired.stdout` fix.
+7. SSC transport fix: UDP instead of TCP only.
+8. `dante_status` detection and the "Dante-confirmed only" filter.
+9. AES67 Listen feature.
+10. Auto-Discovery on by default.
+11. `netifaces` removed; `get_local_subnets()` now parses `ifconfig`.
 
 ## Suggested next steps
 
-1. **Accept the Xcode license and get this committed.** Everything above is uncommitted
-   working-tree state on one machine. That's the actual emergency, not any code issue.
-2. Decide whether to chase the venv-vs-sandbox mystery (does a venv built fresh from
-   `/opt/homebrew/bin/python3` also fail under the preview sandbox, or was that specific
-   to the Xcode-based venv?) — would let `netifaces` work again under the preview tooling.
-3. Hardware-verify SLX-D, Axient Digital, and MXW providers against real units if any
-   become available (currently spec-only per the README).
-4. Whenever venue network access is sorted for the EM 6000s, re-verify both Dante
-   detection and AES67 Listen against real hardware/audio — neither has been confirmed
-   against a fully-reachable Sennheiser unit yet.
-5. `omniwave_history.db` has no pruning/rotation — worth adding before it grows much
-   further.
+1. **Work from git.** Commit this revised `HANDOVER.md` and the `launch.json` change to the
+   repo, so the next person isn't working from a zip. (The macOS `git` needs the Command
+   Line Tools; GitHub Desktop ships its own git if those can't be installed.)
+2. **Get Hillsong IT review** before using it on campus production networks. Combine this
+   with the EM 6000 allow-listing request for this laptop.
+3. **Add authentication** to the admin dashboard and command endpoints, or bind to
+   `127.0.0.1` by default with an opt-in for LAN access.
+4. **Add pruning/rotation** to `omniwave_history.db`.
+5. Hardware-verify the SLX-D, Axient Digital, MXW and Sennheiser SSC providers against real
+   units.
+6. Once venue access is sorted, re-verify Dante detection and AES67 Listen against real
+   EM 6000 hardware and live audio.
+7. Optional: make the data file paths absolute (relative to the script) so launching from
+   another directory doesn't create a second `config.json`/DB.
