@@ -392,7 +392,16 @@ class ShureProvider(BaseProvider):
 #   nn=antenna LEDs; aaa/bbb=RF level per antenna (coarse category, NOT dBm:
 #     020=overload, 070=strong ... 100=weak); d=battery 1-5/U; eee=audio 0-255
 # "x" is the channel: "1" (single/UR4S or left) or "2" (right, UR4D only).
-UHFR_METER_STEPS = 40  # 40 * 30ms ~= 1.2s update interval
+# 1.2s (the old value, 40) is too coarse for a live meter -- confirmed live:
+# polling the running app every second for 15s straight while someone was
+# actually talking into a UHF-R mic showed audio=0 the entire time, even
+# though a direct 150ms-rate capture over the same kind of window caught
+# real (if quiet/intermittent) activity. Between SAMPLE pushes the
+# dashboard just holds the last value it got, so a 1.2s gap means it's
+# easy to never land on a moment with real signal. 10 steps = 300ms keeps
+# this well within Shure's own documented "metering and updating" mode
+# (anything under 12s), just responsive enough to actually track speech.
+UHFR_METER_STEPS = 10  # 10 * 30ms = 300ms update interval
 UHFR_MISS_LIMIT = 5    # consecutive empty polls before considering it unreachable
 
 # eee's 0-255 range is Shure's own documented full-scale (confirmed against
