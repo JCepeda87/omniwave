@@ -141,8 +141,11 @@
     font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
     color: var(--muted); border-bottom: 1px solid var(--border); padding: 10px 2px 6px;
     margin-top: 4px; display: flex; align-items: center; gap: 8px;
+    cursor: pointer; user-select: none;
   }
   .device-group-header:first-child { margin-top: 0; }
+  .device-group-header:hover { color: var(--text); }
+  .device-group-arrow { display: inline-block; width: 10px; font-size: 10px; color: var(--muted); }
   .device-group-count {
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
     padding: 1px 8px; font-size: 11px; font-weight: 600; color: var(--text);
@@ -1091,9 +1094,25 @@ function renderDevices(data) {
   // doesn't read as one undifferentiated wall of cards -- each group's
   // own full-width header, cards underneath keep the normal auto-fill grid.
   devicesEl.innerHTML = groupByType(ips, data).map(group => `
-      <div class="device-group-header" style="grid-column:1/-1">${group.label} <span class="device-group-count">${group.ips.length}</span></div>
-      ${group.ips.map(ip => renderDeviceCard(ip, data)).join('')}
+      ${groupHeader(group, 'grid-column:1/-1')}
+      ${collapsedGroups.has(group.type) ? '' : group.ips.map(ip => renderDeviceCard(ip, data)).join('')}
     `).join('');
+}
+
+// Collapse state is shared between the Devices grid and the RF Plot --
+// both group by the same device type, so "collapse PSM1000" means the
+// same thing in either view rather than needing two separate toggles.
+const collapsedGroups = new Set();
+function toggleGroup(type) {
+  collapsedGroups.has(type) ? collapsedGroups.delete(type) : collapsedGroups.add(type);
+  renderDevices(lastData);
+  renderRfPlot(lastData);
+}
+function groupHeader(group, extraStyle) {
+  const collapsed = collapsedGroups.has(group.type);
+  return `<div class="device-group-header" style="${extraStyle || ''}" onclick="toggleGroup('${group.type}')">
+      <span class="device-group-arrow">${collapsed ? '▸' : '▾'}</span>${group.label} <span class="device-group-count">${group.ips.length}</span>
+    </div>`;
 }
 
 function renderDeviceCard(ip, data) {
@@ -1204,8 +1223,8 @@ function renderRfPlot(data) {
     return;
   }
   el.innerHTML = groupByType(ips, data).map(group => `
-    <div class="device-group-header">${group.label} <span class="device-group-count">${group.ips.length}</span></div>
-    ${group.ips.map(ip => {
+    ${groupHeader(group)}
+    ${collapsedGroups.has(group.type) ? '' : group.ips.map(ip => {
       const d = data[ip];
       const rf = d.metrics ? d.metrics.rf : undefined;
       const hasValue = rf !== undefined && rf !== null;
