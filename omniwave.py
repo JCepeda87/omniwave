@@ -20,7 +20,8 @@ from tornado.ioloop import IOLoop
 from tornado.web import Application, RequestHandler
 from providers import (ShureProvider, SennheiserProvider, UHFRProvider, PSM1000Provider,
                        SLXDProvider, AxientDigitalProvider, MXWProvider, SennheiserSSCProvider,
-                       SennheiserG4Provider, NoNetworkProvider, freq_in_ranges)
+                       SennheiserG4Provider, SennheiserEWDXProvider, NoNetworkProvider, freq_in_ranges,
+                       EWDX_PRODUCT_CHANNELS)
 import aes67
 import spectrum_planner
 
@@ -106,6 +107,16 @@ SENNHEISER_NO_NETWORK_TYPES = {'xswd', 'xsw-iem', 'avx'}
 # determined for real from which commands the unit actually accepts
 # (see identify_device()), not guessed from a model string.
 SENNHEISER_G4_TYPES = {'sennheiser-g4-em', 'sennheiser-g4-sr'}
+# EW-DX over SSCv2 (HTTPS REST, port 443, password-authenticated) -- a wholly
+# different transport from SENNHEISER_SSC_TYPES' SSCv1 (plain JSON, port 45,
+# unauthenticated), not just a newer version of the same connection, so it's
+# its own provider/type rather than folded into SENNHEISER_SSC_TYPES. Only
+# reachable with a user-supplied 3rd-party password (see
+# SennheiserEWDXProvider's module comment in providers.py), so -- unlike
+# every other type here -- this one is never auto-discovered/auto-added:
+# identify_device() can recognize it (its /device/identity needs no auth),
+# but nothing here can guess a password, so it's manual-add-only.
+SENNHEISER_SSCV2_TYPES = {'ewdx-sscv2'}
 
 # A receiver picks up RF from a body-worn mic/instrument transmitter and
 # hands off clean audio (ULX-D, QLX-D, SLX-D, Axient Digital, UHF-R, MXW,
@@ -122,8 +133,8 @@ TRANSMITTER_TYPES = {'psm1000', 'psm900', 'psm300', 'xsw-iem', 'sennheiser-g4-sr
 def device_role(dtype):
     return 'transmitter' if dtype in TRANSMITTER_TYPES else 'receiver'
 
-def make_provider(ip, brand, dtype, channel=1):
-    dev = _make_provider_instance(ip, brand, dtype, channel)
+def make_provider(ip, brand, dtype, channel=1, password=None):
+    dev = _make_provider_instance(ip, brand, dtype, channel, password)
     # Stored directly rather than derived from isinstance() -- DataHandler
     # used to infer brand from a hardcoded isinstance() tuple that predated
     # SLXDProvider/AxientDigitalProvider/MXWProvider/NoNetworkProvider, so
@@ -133,7 +144,7 @@ def make_provider(ip, brand, dtype, channel=1):
     dev.role = device_role(dtype)
     return dev
 
-def _make_provider_instance(ip, brand, dtype, channel=1):
+def _make_provider_instance(ip, brand, dtype, channel=1, password=None):
     if brand == 'shure':
         if dtype == 'uhf-r':
             return UHFRProvider(ip, dtype, channel=channel)
@@ -148,6 +159,8 @@ def _make_provider_instance(ip, brand, dtype, channel=1):
         if dtype in SHURE_NO_NETWORK_TYPES:
             return NoNetworkProvider(ip, dtype)
         return ShureProvider(ip, dtype, channel=channel)
+    if dtype in SENNHEISER_SSCV2_TYPES:
+        return SennheiserEWDXProvider(ip, dtype, channel=channel, password=password)
     if dtype in SENNHEISER_SSC_TYPES:
         return SennheiserSSCProvider(ip, dtype, channel=channel)
     if dtype in SENNHEISER_G4_TYPES:
@@ -493,13 +506,15 @@ class StaticHandler(RequestHandler):
         with open(full_path, 'rb') as f:
             self.write(f.read())
 
-async def register_device_channels(ip, brand, dtype, name):
+async def register_device_channels(ip, brand, dtype, name, password=None):
     """Discovers this unit's real channels (see discover_channels()) and
     creates one connected provider instance per channel, each under its own
     device_key and persisted to config.json as a separate entry -- shared by
     the manual Add Device flow and background auto-discovery so a ULXD4Q or
-    multi-channel PSM1000 shows up as N independent devices, not one."""
-    channels = await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, discover_channels, ip, brand, dtype)
+    multi-channel PSM1000 shows up as N independent devices, not one.
+    `password` only applies to SENNHEISER_SSCV2_TYPES (see that set's
+    comment) -- ignored otherwise, same as every provider's constructor."""
+    channels = await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, discover_channels, ip, brand, dtype, password)
     # Explicit (re-)registration always wins over a past removal -- clears
     # any stale ignored_ips entry so this ip isn't silently blocked from
     # auto-discovery forever after being deliberately brought back.
@@ -507,12 +522,12 @@ async def register_device_channels(ip, brand, dtype, name):
     added = []
     for channel in channels:
         key = device_key(ip, channel)
-        dev = make_provider(ip, brand, dtype, channel)
+        dev = make_provider(ip, brand, dtype, channel, password)
         await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.connect)
         Devices[key] = dev
         DeviceNames[key] = name
         DeviceLayout.setdefault(key, {'size': 'md', 'order': len(Devices)})
-        save_device_to_config(ip, brand, dtype, name, channel)
+        save_device_to_config(ip, brand, dtype, name, channel, password=password)
         added.append({'ip': ip, 'channel': channel, 'key': key, 'status': dev.status})
     return added
 
@@ -525,12 +540,13 @@ class DeviceHandler(RequestHandler):
         brand = params.get('brand', 'shure')
         dtype = params.get('type', 'axtd')
         name = (params.get('name') or '').strip()
+        password = params.get('password') or None
         if not ip:
             self.set_status(400)
             self.write(json.dumps({'error': 'ip is required'}))
             return
 
-        added = await register_device_channels(ip, brand, dtype, name)
+        added = await register_device_channels(ip, brand, dtype, name, password=password)
         self.write(json.dumps({
             'success': True, 'ip': ip, 'channels': [a['channel'] for a in added], 'devices': added,
         }))
@@ -1200,6 +1216,24 @@ def identify_device(ip):
     except (OSError, ValueError, AttributeError, IndexError):
         pass
 
+    # EW-DX SSCv2 (HTTPS REST, port 443) -- a completely different protocol
+    # from SSCv1 above (port 45), confirmed live: a real EW-DX with
+    # 3rd-party access not yet enabled refuses every connection on port 45
+    # and 2202, but /api/device/identity needs no auth at all (per the
+    # published OpenAPI spec), so this alone can positively identify the
+    # device even before anyone has set a 3rd-party password on it -- the
+    # password (needed for everything else) still has to be entered
+    # manually; see SENNHEISER_SSCV2_TYPES.
+    try:
+        r = requests.get(f'https://{ip}:443/api/device/identity', timeout=IDENTIFY_TIMEOUT, verify=False)
+        if r.ok:
+            product = r.json().get('product')
+            if isinstance(product, str) and product.strip():
+                product = product.strip()
+                return {'brand': 'sennheiser', 'type': 'ewdx-sscv2', 'label': f'EW-DX ({product}, SSCv2)', 'name': product}
+    except (requests.RequestException, ValueError):
+        pass
+
     # Sennheiser ew G4 "Media control protocol": plain ASCII over UDP port
     # 53212 (same port for send+receive), NOT the SSC/port-45 protocol
     # probed above -- G4 stationary EM (receiver) / SR (IEM transmitter)
@@ -1280,7 +1314,23 @@ def _ip_already_registered(ip):
 CHANNEL_REP_RE = re.compile(r'REP\s+(\d+)\s+\S')
 PSM1000_CHANNEL_RE = re.compile(r'REPORT\s+(\d+)\s+AUDIO_IN_LVL')
 
-def discover_channels(ip, brand, dtype):
+def discover_channels(ip, brand, dtype, password=None):
+    if dtype in SENNHEISER_SSCV2_TYPES:
+        # /device/identity needs no auth (per the OpenAPI spec) and its
+        # `product` enum (EWDX2CHS/EWDX2CHDS/EWDX4CHDS) directly names the
+        # real channel count -- no need to even have the password yet just
+        # to know how many channels to register.
+        try:
+            r = requests.get(f'https://{ip}:443/api/device/identity', timeout=IDENTIFY_TIMEOUT, verify=False)
+            if r.ok:
+                product = r.json().get('product', '')
+                for key, count in EWDX_PRODUCT_CHANNELS.items():
+                    if key == product:
+                        return list(range(1, count + 1))
+        except requests.RequestException:
+            pass
+        return [1]
+
     if brand == 'shure' and dtype in ('ulxd', 'qlxd', 'slxd-plus', 'axient-digital'):
         # GET 0 ALL asks for every channel's data in one shot (0 = "all
         # channels" in this protocol family); each channel reports its own
@@ -1393,6 +1443,13 @@ def run_auto_discovery_scan():
         if _ip_already_registered(ip) or is_ignored_ip(ip):
             continue
         info = identify_device(ip)
+        if info and info['type'] in SENNHEISER_SSCV2_TYPES:
+            # Needs a password nothing here can guess -- auto-adding it
+            # would just register a permanently-disconnected device with no
+            # way to fix it short of deleting and re-adding manually. Still
+            # surfaced fine by the manual Scan/Probe flows (see
+            # run_discovery_scan()), which show it to a human to enter one.
+            continue
         if info:
             found.append({'ip': ip, **info})
     return found
@@ -1733,12 +1790,17 @@ def _same_device(entry, ip, channel):
     return (entry.get('ip') == ip and int(entry.get('channel', 1)) == channel
             and entry.get('location', DEFAULT_LOCATION) == ACTIVE_LOCATION)
 
-def save_device_to_config(ip, brand, dtype, name='', channel=1, location=None):
+def save_device_to_config(ip, brand, dtype, name='', channel=1, location=None, password=None):
     devices = [d for d in load_config() if not _same_device(d, ip, channel)]
-    devices.append({
+    entry = {
         'ip': ip, 'brand': brand, 'type': dtype, 'name': name, 'channel': channel,
         'location': location or ACTIVE_LOCATION,
-    })
+    }
+    # Only SENNHEISER_SSCV2_TYPES uses this (see its comment) -- omitted
+    # entirely for every other device rather than writing a pointless null.
+    if password:
+        entry['password'] = password
+    devices.append(entry)
     save_config(devices)
 
 def remove_device_from_config(ip, channel=1):
@@ -1836,7 +1898,7 @@ async def _load_location(location, device_list=None):
         dtype = dev_cfg.get('type', 'axtd')
         channel = dev_cfg.get('channel', 1)
         key = device_key(ip, channel)
-        dev = make_provider(ip, brand, dtype, channel)
+        dev = make_provider(ip, brand, dtype, channel, dev_cfg.get('password'))
         Devices[key] = dev
         tasks.append(_connect_loaded_device(key, dev, dev_cfg, idx))
     if tasks:

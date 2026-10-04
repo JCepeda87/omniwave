@@ -347,8 +347,13 @@
         </select>
         <select name="type" id="typeSelect"></select>
         <input name="typeCustom" id="typeCustom" placeholder="model name" style="display:none">
+        <input name="password" id="devicePassword" type="password" placeholder="3rd-party password" style="display:none">
         <button type="submit">Add device</button>
       </form>
+      <div class="device-meta" id="devicePasswordHint" style="display:none">
+        EW-DX SSCv2 is off by default on real hardware -- 3rd-party access and this password have to be turned on
+        from Sennheiser Control Cockpit first, or every connection attempt will be refused.
+      </div>
       <div class="device-meta" style="margin-top:6px">
         Multi-channel receivers (a dual UR4D, quad ULXD4Q, dual PSM1000 P10T, ...) are detected automatically --
         this queries the unit for its real channel count and adds each channel as its own device, rather than
@@ -587,6 +592,7 @@ const DEVICE_MODELS = {
     ['digital9000', 'Digital 9000'],
     ['digital6000', 'Digital 6000'],
     ['ewdx', 'EW-DX'],
+    ['ewdx-sscv2', 'EW-DX (SSCv2, secure -- needs 3rd-party password)'],
     ['ewd', 'EW-D'],
     ['ew-g4', 'evolution wireless G4 (100/300/500)'],
     ['xswd', 'XSW-D'],
@@ -627,6 +633,8 @@ function groupByType(ips, data) {
 const brandSelect = document.getElementById('brandSelect');
 const typeSelect = document.getElementById('typeSelect');
 const typeCustom = document.getElementById('typeCustom');
+const devicePassword = document.getElementById('devicePassword');
+const devicePasswordHint = document.getElementById('devicePasswordHint');
 
 function populateModelOptions() {
   const models = DEVICE_MODELS[brandSelect.value] || [];
@@ -639,6 +647,10 @@ function updateCustomVisibility() {
   const isCustom = typeSelect.value === 'custom';
   typeCustom.style.display = isCustom ? '' : 'none';
   typeCustom.required = isCustom;
+  const needsPassword = typeSelect.value === 'ewdx-sscv2';
+  devicePassword.style.display = needsPassword ? '' : 'none';
+  devicePassword.required = needsPassword;
+  devicePasswordHint.style.display = needsPassword ? '' : 'none';
 }
 
 brandSelect.addEventListener('change', populateModelOptions);
@@ -649,6 +661,21 @@ function modelOptionsHtml(brand, selectedType) {
   const models = DEVICE_MODELS[brand] || DEVICE_MODELS.shure;
   return models.map(([value, label]) =>
     `<option value="${value}" ${value === selectedType ? 'selected' : ''}>${label}</option>`).join('');
+}
+
+// EW-DX SSCv2 is the one device type that needs a password at add-time
+// (see SENNHEISER_SSCV2_TYPES in omniwave.py) -- this renders a hidden-by-
+// default password input next to a model <select>, shown whenever that
+// select's value is 'ewdx-sscv2', reused by the Scan and Probe IP result
+// rows below as well as the main Add Device form.
+function passwordInputHtml(inputId, selectedType) {
+  const show = selectedType === 'ewdx-sscv2';
+  return `<input type="password" id="${inputId}" placeholder="3rd-party password" style="${show ? '' : 'display:none'}">`;
+}
+function toggleRowPassword(selectId, inputId) {
+  const select = document.getElementById(selectId);
+  const input = document.getElementById(inputId);
+  if (select && input) input.style.display = select.value === 'ewdx-sscv2' ? '' : 'none';
 }
 
 async function scanNetwork() {
@@ -675,7 +702,8 @@ async function scanNetwork() {
               ${c.identified ? (c.name ? `Identified as ${c.name}` : 'Identified, no name reported') : "Couldn't confirm model — pick one manually below"}
             </div>
           </div>
-          <select id="discModel-${i}">${modelOptionsHtml(c.brand, c.type)}</select>
+          <select id="discModel-${i}" onchange="toggleRowPassword('discModel-${i}', 'discPassword-${i}')">${modelOptionsHtml(c.brand, c.type)}</select>
+          ${passwordInputHtml(`discPassword-${i}`, c.type)}
           <button onclick="addDiscovered('${c.ip}', '${c.brand}', ${i})">Add</button>
         </div>`).join('');
     }
@@ -691,9 +719,10 @@ async function scanNetwork() {
 async function addDiscovered(ip, brand, idx) {
   const select = document.getElementById('discModel-' + idx);
   const type = select ? select.value : 'custom';
+  const passwordInput = document.getElementById('discPassword-' + idx);
   await fetch('/devices', {
     method: 'POST',
-    body: JSON.stringify({ ip, brand, type }),
+    body: JSON.stringify({ ip, brand, type, password: passwordInput ? passwordInput.value : undefined }),
   });
   refresh();
   scanNetwork();
@@ -725,7 +754,8 @@ async function probeIp() {
             <div class="device-name">${c.ip} — ${c.label || c.brand}</div>
             <div class="device-meta">${c.name ? `Identified as ${c.name}` : 'Identified, no name reported'}</div>
           </div>
-          <select id="probeModel">${modelOptionsHtml(c.brand, c.type)}</select>
+          <select id="probeModel" onchange="toggleRowPassword('probeModel', 'probePassword')">${modelOptionsHtml(c.brand, c.type)}</select>
+          ${passwordInputHtml('probePassword', c.type)}
           <button onclick="addProbed('${c.ip}', '${c.brand}')">Add</button>
         </div>`;
     }
@@ -739,9 +769,10 @@ async function probeIp() {
 async function addProbed(ip, brand) {
   const select = document.getElementById('probeModel');
   const type = select ? select.value : 'custom';
+  const passwordInput = document.getElementById('probePassword');
   await fetch('/devices', {
     method: 'POST',
-    body: JSON.stringify({ ip, brand, type }),
+    body: JSON.stringify({ ip, brand, type, password: passwordInput ? passwordInput.value : undefined }),
   });
   refresh();
   document.getElementById('probeResult').innerHTML = '';
@@ -1532,6 +1563,7 @@ document.getElementById('addForm').addEventListener('submit', async (e) => {
       name: fd.get('name'),
       brand: fd.get('brand'),
       type: type,
+      password: fd.get('password'),
     }),
   });
   e.target.reset();

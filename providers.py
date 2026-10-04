@@ -7,8 +7,17 @@ import queue
 import logging
 import threading
 import requests
+import urllib3
 from abc import ABC, abstractmethod
 from collections import defaultdict
+
+# EW-DX's SSCv2 server presents a self-signed cert (confirmed by Sennheiser's
+# own "Enabling Third Party Access" flow, which never involves installing a
+# CA cert) -- SennheiserEWDXProvider below deliberately skips verification
+# (the connection is still TLS-encrypted, just not validated against a CA),
+# so silence the per-request warning urllib3 would otherwise print for every
+# single poll.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Shure ULX-D/QLX-D/SLX-D "Command Strings" protocol (Ethernet TCP port
 # 2202, ASCII). Confirmed live against a real ULXD4Q receiver, and matches
@@ -1908,4 +1917,195 @@ class SennheiserSSCProvider(BaseProvider):
                 else:
                     return False
             except (OSError, socket.error, ValueError):
+                return False
+
+# EW-DX SSCv2: a completely different protocol from SSCv1 above, not just a
+# version bump -- a secure RESTful API over HTTPS (TLS, port 443, HTTP Basic
+# auth as user "api" with a password the user sets via Sennheiser Control
+# Cockpit), confirmed against the real published OpenAPI 1.7 spec:
+# https://docs.cloud.sennheiser.com/en-us/api-docs/api-docs/open-api-ew-dx.html
+# (raw spec: https://bgzkwm.files.cmp.optimizely.com/download/assets/EW-DX_openapi_3rdparty_release_1.7.yaml)
+# 3rd-party access is OFF by default on real hardware and can only be turned
+# on from Control Cockpit -- this app can't do that remotely (confirmed
+# live: the device actively refuses every connection on its control ports
+# until that's done), so a password is required up front here rather than
+# discovered automatically the way other providers connect.
+#   GET  /api/device/identity                        -- no auth required;
+#     {product, hardwareRevision, serial, vendor}. product is one of
+#     EWDX2CHS/EWDX2CHDS/EWDX4CHDS -- the "2CH"/"4CH" in that string is this
+#     unit's real channel count, used for channel discovery (see
+#     omniwave.py's discover_channels()) without needing the password at all.
+#   GET  /api/channel/{0-3}                           -- {name, mute, ...}
+#   GET  /api/channel/{0-3}/signalQualityIndicator     -- {value: 0-100%},
+#     tagged FastResource (Sennheiser's own term for "meant to be polled at
+#     short intervals", not just via the SSE subscription mechanism this
+#     provider doesn't use) -- used directly as this app's rf metric, no
+#     scaling needed, unlike every Shure provider's raw dBm/dBFS conversion.
+#   GET  /api/channel/{0-3}/level                      -- {value: -138.5..0
+#     dBFS}, also FastResource -- converted to 0-100 with the same
+#     distance-from-floor formula SSCv1's audio field above already uses.
+#   GET  /api/rf/channels/{0-3}                        -- {frequency: kHz}
+#   PUT  /api/rf/channels/{0-3}/frequency {frequency: kHz}  -- settable,
+#     wired up the same as every other receiver provider's FREQUENCY command.
+#   GET  /api/transmitters/{0-3}/battery               -- {gauge: 0-100%,
+#     lifetime: minutes}; 422 means no transmitter is currently linked to
+#     that channel (not an error -- treated as battery simply unknown, same
+#     as every other provider's "no transmitter paired" case).
+# None of this has been verified against the real unit yet -- the user's
+# own hardware had 3rd-party access off (the reason this was built) and
+# turning it on requires them to run Control Cockpit first.
+EWDX_PRODUCT_CHANNELS = {'EWDX2CHS': 2, 'EWDX2CHDS': 2, 'EWDX4CHDS': 4}
+EWDX_REQUEST_TIMEOUT = 1.5
+
+class SennheiserEWDXProvider(BaseProvider):
+    def __init__(self, ip, device_type, photo=None, channel=1, password=None):
+        super().__init__(ip, device_type, photo)
+        self.channel = channel
+        self.password = password
+        self.session = None
+        self._miss_count = 0
+        self._queried_static = False
+
+    def _base_url(self):
+        return f'https://{self.ip}:443'
+
+    def _channel_id(self):
+        return self.channel - 1
+
+    def connect(self):
+        with self._io_lock:
+            if not self.password:
+                self.status = 'DISCONNECTED'
+                self.last_command_error = "No 3rd-party password set for this device"
+                return
+            try:
+                self.session = requests.Session()
+                self.session.auth = ('api', self.password)
+                self.session.verify = False
+                # /device/identity needs no auth and confirms this is really
+                # an EW-DX; the channel GET right after is the real
+                # reachability+auth check (a wrong password gets a clean 401
+                # here, not a hang or a generic connection failure).
+                r = self.session.get(f'{self._base_url()}/api/device/identity', timeout=EWDX_REQUEST_TIMEOUT)
+                if r.ok:
+                    product = r.json().get('product')
+                    if product:
+                        self.model = product
+                r = self.session.get(f'{self._base_url()}/api/channel/{self._channel_id()}', timeout=EWDX_REQUEST_TIMEOUT)
+                if r.status_code == 401:
+                    self.status = 'DISCONNECTED'
+                    self.last_command_error = "Device rejected the 3rd-party password"
+                    return
+                r.raise_for_status()
+                self.status = 'CONNECTED'
+                self._miss_count = 0
+                self._queried_static = False
+            except requests.RequestException:
+                self.status = 'DISCONNECTED'
+
+    def disconnect(self):
+        with self._io_lock:
+            if self.session:
+                try: self.session.close()
+                except Exception: pass
+            self.status = 'DISCONNECTED'
+
+    def _get(self, path):
+        return self.session.get(f'{self._base_url()}{path}', timeout=EWDX_REQUEST_TIMEOUT)
+
+    def poll(self):
+        if self.status != 'CONNECTED': return
+        with self._io_lock:
+            ch = self._channel_id()
+            ok = False
+            try:
+                r = self._get(f'/api/channel/{ch}/signalQualityIndicator')
+                if r.ok:
+                    ok = True
+                    self.metrics['rf'] = max(0, min(100, round(r.json()['value'])))
+
+                r = self._get(f'/api/channel/{ch}/level')
+                if r.ok:
+                    ok = True
+                    af = r.json()['value']
+                    # -138.5..0 dBFS -> 0-100, same convention as SSCv1's af above.
+                    self.metrics['audio'] = max(0, min(100, round((af + 138.5) / 138.5 * 100)))
+
+                if not self._queried_static:
+                    r = self._get(f'/api/rf/channels/{ch}')
+                    if r.ok:
+                        self.metrics['frequency_mhz'] = round(r.json()['frequency'] / 1000, 4)
+                    self._queried_static = True
+
+                r = self._get(f'/api/transmitters/{ch}/battery')
+                if r.ok:
+                    ok = True
+                    data = r.json()
+                    gauge = data.get('gauge')
+                    self.metrics['batt'] = round(gauge) if gauge is not None else None
+                    self.metrics['batt_minutes'] = data.get('lifetime')
+                elif r.status_code == 422:
+                    # No transmitter currently linked to this channel.
+                    ok = True
+                    self.metrics['batt'] = None
+                    self.metrics['batt_minutes'] = None
+
+                r = self._get(f'/api/channel/{ch}')
+                if r.ok:
+                    ok = True
+                    data = r.json()
+                    if isinstance(data.get('mute'), bool):
+                        self.metrics['muted'] = data['mute']
+
+                if ok:
+                    self._miss_count = 0
+                else:
+                    self._miss_count += 1
+                    if self._miss_count >= NETWORK_MISS_LIMIT:
+                        self._mark_unreachable()
+                        return
+
+                batt = self.metrics.get('batt')
+                if batt is not None and batt < 20:
+                    alert = f"Low Battery: {batt}%"
+                    if not self.alerts or self.alerts[-1] != alert:
+                        self.alerts.append(alert)
+                        self.alerts = self.alerts[-20:]
+            except requests.RequestException:
+                self._mark_unreachable()
+
+    def _mark_unreachable(self):
+        self.status = 'DISCONNECTED'
+        self.metrics = {}
+        self._miss_count = 0
+        self._queried_static = False
+
+    def scan_rf(self):
+        self.spectrum_data = []
+
+    def send_command(self, cmd_type, value, channel=1):
+        if self.status != 'CONNECTED': return False
+        with self._io_lock:
+            try:
+                ch = channel - 1
+                if cmd_type == 'FREQUENCY':
+                    khz = int(round(float(value) * 1000))
+                    r = self.session.put(f'{self._base_url()}/api/rf/channels/{ch}/frequency',
+                                          json={'frequency': khz}, timeout=EWDX_REQUEST_TIMEOUT)
+                    if not r.ok:
+                        self.last_command_error = f"Device rejected the frequency (HTTP {r.status_code})."
+                        return False
+                    confirm = self._get(f'/api/rf/channels/{ch}')
+                    if confirm.ok:
+                        self.metrics['frequency_mhz'] = round(confirm.json()['frequency'] / 1000, 4)
+                    return self.metrics.get('frequency_mhz') == round(khz / 1000, 4)
+                elif cmd_type == 'MUTE':
+                    r = self.session.put(f'{self._base_url()}/api/channel/{ch}',
+                                          json={'mute': bool(value)}, timeout=EWDX_REQUEST_TIMEOUT)
+                    if r.ok:
+                        self.metrics['muted'] = bool(value)
+                    return r.ok
+                else:
+                    return False
+            except requests.RequestException:
                 return False
