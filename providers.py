@@ -199,7 +199,14 @@ class ShureProvider(BaseProvider):
             self.status = 'DISCONNECTED'
 
     def _send(self, message):
-        self.sock.sendall(message.encode('ascii'))
+        # CRLF-terminated per Shure's published Command Strings spec. These
+        # product lines' firmware tolerates its absence (confirmed live
+        # this session), but PSM1000's doesn't -- it silently drops every
+        # unterminated command instead of erroring, which read as "no
+        # control channel" until this was added. Sending it everywhere
+        # keeps every TCP bracket-protocol provider actually spec-compliant
+        # rather than "happens to work on the units tested so far".
+        self.sock.sendall(message.encode('ascii') + b'\r\n')
 
     def _read_messages(self, timeout=0.4, stop_early=True):
         """Read whatever arrives within `timeout`, split into complete
@@ -598,18 +605,34 @@ class UHFRProvider(BaseProvider):
             except (OSError, socket.error, ValueError):
                 return False
 
-# Shure PSM1000 (P10T transmitter) network telemetry -- confirmed live
-# against real hardware, but there is no public command-strings reference
-# for this product the way there is for ULX-D/QLX-D/UHF-R. Unlike all of
-# those, this is pure one-way push: the moment you connect on TCP port
-# 2202 it continuously streams
+# Shure PSM1000 (P10T transmitter) network telemetry. The moment you
+# connect on TCP port 2202 it continuously streams
 #   < REPORT x AUDIO_IN_LVL_L yyy >
 #   < REPORT x AUDIO_IN_LVL_R yyy >
-# and does not respond to any GET/SET command tried, in either '< >' or
-# '*' delimiter style, over TCP or UDP. So only what's actually observed
-# on the wire is implemented -- no battery/frequency/RF, since the P10T
-# exposes none of that here (it's a transmitter base station, not a
-# receiver, so those wouldn't mean the same thing even if they existed).
+# unprompted. An earlier pass concluded GET/SET weren't supported at all --
+# wrong, and for a simple reason: Shure's real published spec
+# (https://www.shure.com/en-US/docs/commandstrings/PSM1000, a JS-rendered
+# page that doesn't show up in a plain fetch, which is presumably why it
+# was missed) requires every message to be CRLF-terminated, and the
+# commands sent during that pass had no terminator at all. The P10T just
+# silently never parsed them -- and kept right on pushing its unsolicited
+# audio stream either way, so "no reply but the connection's clearly
+# alive" read as "no control channel" rather than "malformed message".
+# Confirmed live against a real unit once CRLF was added: GET FREQUENCY,
+# RF_TX_LVL and RF_MUTE all come back correctly, matching Wireless
+# Workbench's own display for the same unit exactly (683.800 MHz, 10 mW,
+# unmuted). RF_MUTE is what WWB's "RF" column on a transmitter actually
+# shows -- a 2-state on/off indicator (no handshake with a receiver to
+# meter signal quality against, unlike an actual receiver's RF bar), not a
+# continuous signal-strength reading -- so it's surfaced here as the 'rf'
+# metric mapped to 0 (muted -- no RF being transmitted) / 100 (unmuted),
+# reusing the same bar/low-flag UI as every other device's rf meter.
+# Only GET is wired up here, not SET: this app's frequency-assign UI can
+# push a live frequency to a receiver mid-show, and doing that to a
+# transmitter that's actively feeding a performer's in-ear mix is a much
+# higher-stakes mistake than it looks like from a receiver's RF bar --
+# left as a deliberate read-only scope for now rather than wiring that up
+# unasked.
 # Live measurement against real hardware (8 units, actual speech vs. quiet
 # background): raw AUDIO_IN_LVL values ranged from ~17,000 up to
 # ~3,548,184 -- a >150x spread within one ~20s capture. That rules out any
@@ -643,12 +666,7 @@ class PSM1000Provider(BaseProvider):
         self.sock = None
         self._buffer = ''
         self._miss_count = 0
-        # Genuinely unknowable over this protocol, not just "not assigned
-        # yet": the P10T is a one-way push transmitter with no GET/SET
-        # channel at all (see the module comment above), so there's no way
-        # to ask it what frequency it's tuned to -- even though the real
-        # hardware obviously is tuned to one, since RF is actually flowing.
-        self.freq_unavailable_reason = "Not reported by this transmitter (one-way protocol, no query channel)"
+        self._queried_static = False
 
     def connect(self):
         with self._io_lock:
@@ -659,6 +677,7 @@ class PSM1000Provider(BaseProvider):
                 self.status = 'CONNECTED'
                 self._buffer = ''
                 self._miss_count = 0
+                self._queried_static = False
             except Exception:
                 self.status = 'DISCONNECTED'
 
@@ -673,6 +692,11 @@ class PSM1000Provider(BaseProvider):
                 try: self.sock.close()
                 except Exception: pass
             self.status = 'DISCONNECTED'
+
+    def _send(self, message):
+        # CRLF-terminated per Shure's published spec -- see the module
+        # comment above for why this matters here specifically.
+        self.sock.sendall(message.encode('ascii') + b'\r\n')
 
     def _read_messages(self, timeout=0.4):
         self.sock.settimeout(timeout)
@@ -692,24 +716,50 @@ class PSM1000Provider(BaseProvider):
             self._buffer = self._buffer[end + 1:]
         return messages
 
+    def _apply_report(self, param, value):
+        value = value.strip()
+        if param == 'FREQUENCY':
+            try: self.metrics['frequency_mhz'] = int(value) / 1000
+            except ValueError: pass
+        elif param == 'RF_MUTE':
+            # 1 = muted (no RF being transmitted), 0 = unmuted -- see the
+            # module comment above for why this becomes the 'rf' metric.
+            self.metrics['rf'] = 0 if value == '1' else 100
+        elif param == 'RF_TX_LVL':
+            try: self.metrics['rf_tx_mw'] = int(value)
+            except ValueError: pass
+
     def poll(self):
         if self.status != 'CONNECTED': return
         with self._io_lock:
             try:
+                if not self._queried_static:
+                    # FREQUENCY/RF_TX_LVL only change when someone
+                    # deliberately retunes or repowers the unit -- no need
+                    # to re-ask every 0.5s cycle like RF_MUTE/audio.
+                    self._send(f'< GET {self.channel} FREQUENCY >')
+                    self._send(f'< GET {self.channel} RF_TX_LVL >')
+                    self._queried_static = True
+                self._send(f'< GET {self.channel} RF_MUTE >')
                 messages = self._read_messages()
                 left = right = None
                 for msg in messages:
                     parts = msg.split()
-                    if len(parts) < 4 or parts[0] != 'REPORT' or parts[1] != str(self.channel):
+                    if len(parts) < 3 or parts[0] != 'REPORT':
                         continue
-                    try:
-                        value = int(parts[3])
-                    except ValueError:
+                    # Channel-scoped REPORTs (REPORT x PARAM value) only --
+                    # box-level params (e.g. REPORT DEVICE_NAME v) aren't
+                    # queried here, so nothing to route for those.
+                    if parts[1] != str(self.channel) or len(parts) < 4:
                         continue
-                    if parts[2] == 'AUDIO_IN_LVL_L':
-                        left = value
-                    elif parts[2] == 'AUDIO_IN_LVL_R':
-                        right = value
+                    param = parts[2]
+                    if param in ('AUDIO_IN_LVL_L', 'AUDIO_IN_LVL_R'):
+                        try: value = int(parts[3])
+                        except ValueError: continue
+                        if param == 'AUDIO_IN_LVL_L': left = value
+                        else: right = value
+                    else:
+                        self._apply_report(param, parts[3])
                 readings = [v for v in (left, right) if v is not None]
                 if readings:
                     self.metrics['audio'] = _psm1000_audio_pct(max(readings))
@@ -728,7 +778,9 @@ class PSM1000Provider(BaseProvider):
         self.spectrum_data = []
 
     def send_command(self, cmd_type, value, channel=1):
-        return False  # no responsive control channel found for this device
+        # Read-only by design -- see the module comment above. FREQUENCY is
+        # queryable (above) but deliberately not SET-able here.
+        return False
 
 # Shure SLX-D "Command Strings" protocol -- same TCP 2202 bracket syntax as
 # ULX-D/QLX-D, but NOT hardware-verified (no SLX-D unit available to test
@@ -798,7 +850,14 @@ class SLXDProvider(BaseProvider):
             self.status = 'DISCONNECTED'
 
     def _send(self, message):
-        self.sock.sendall(message.encode('ascii'))
+        # CRLF-terminated per Shure's published Command Strings spec. These
+        # product lines' firmware tolerates its absence (confirmed live
+        # this session), but PSM1000's doesn't -- it silently drops every
+        # unterminated command instead of erroring, which read as "no
+        # control channel" until this was added. Sending it everywhere
+        # keeps every TCP bracket-protocol provider actually spec-compliant
+        # rather than "happens to work on the units tested so far".
+        self.sock.sendall(message.encode('ascii') + b'\r\n')
 
     def _read_messages(self, timeout=0.4, stop_early=True):
         deadline = time.time() + timeout
@@ -1005,7 +1064,14 @@ class AxientDigitalProvider(BaseProvider):
             self.status = 'DISCONNECTED'
 
     def _send(self, message):
-        self.sock.sendall(message.encode('ascii'))
+        # CRLF-terminated per Shure's published Command Strings spec. These
+        # product lines' firmware tolerates its absence (confirmed live
+        # this session), but PSM1000's doesn't -- it silently drops every
+        # unterminated command instead of erroring, which read as "no
+        # control channel" until this was added. Sending it everywhere
+        # keeps every TCP bracket-protocol provider actually spec-compliant
+        # rather than "happens to work on the units tested so far".
+        self.sock.sendall(message.encode('ascii') + b'\r\n')
 
     def _read_messages(self, timeout=0.4, stop_early=True):
         deadline = time.time() + timeout
@@ -1202,7 +1268,14 @@ class MXWProvider(BaseProvider):
             self.status = 'DISCONNECTED'
 
     def _send(self, message):
-        self.sock.sendall(message.encode('ascii'))
+        # CRLF-terminated per Shure's published Command Strings spec. These
+        # product lines' firmware tolerates its absence (confirmed live
+        # this session), but PSM1000's doesn't -- it silently drops every
+        # unterminated command instead of erroring, which read as "no
+        # control channel" until this was added. Sending it everywhere
+        # keeps every TCP bracket-protocol provider actually spec-compliant
+        # rather than "happens to work on the units tested so far".
+        self.sock.sendall(message.encode('ascii') + b'\r\n')
 
     def _read_messages(self, timeout=0.4, stop_early=True):
         deadline = time.time() + timeout
