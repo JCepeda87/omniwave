@@ -787,9 +787,15 @@ class PSM1000Provider(BaseProvider):
 # against). Built from Shure's published spec (Version 2, 2020-G):
 # https://www.shure.com/en-US/docs/commandstrings/SLXD
 #   SAMPLE x ALL audPeak audRms rfRssi -- 3 fields, each 0-120 raw; actual
-#     value = raw - 120 (dBFS for audio, dBm for RF). Shown here as raw/120
-#     scaled to a 0-100 "signal strength" percent rather than converting to
-#     the negative dB value, to match how the rest of this app displays rf/audio.
+#     value = raw - 120 (dBFS for audio, dBm for RF). rf is stored as that
+#     real dBm value (raw - 120), not a 0-120-scaled percent -- ULX-D/QLX-D
+#     already store raw dBm this way and the frontend's rfDisplayPct()/
+#     rfIsLow() apply a calibrated -90..-20dBm display window to it; an
+#     earlier version of this provider instead did its own flat raw/120
+#     percent, on the mistaken premise that matched "how the rest of the
+#     app displays rf" when it didn't. No SLX-D unit has actually been
+#     available to verify this against real hardware -- unlike the
+#     identical fix in AxientDigitalProvider below, confirmed live.
 #   battery: TX_BATT_BARS (0-5 bars, 255=unknown) -- there is no percent-
 #     based battery parameter in this protocol, unlike ULX-D's BATT_CHARGE.
 #   mute: absent from the entire published command set -- SLX-D has no
@@ -917,7 +923,7 @@ class SLXDProvider(BaseProvider):
                     continue
                 try:
                     self.metrics['audio'] = max(0, min(100, round(int(parts[3]) / 120 * 100)))
-                    self.metrics['rf'] = max(0, min(100, round(int(parts[5]) / 120 * 100)))
+                    self.metrics['rf'] = int(parts[5]) - 120
                 except (ValueError, IndexError):
                     pass
                 continue
@@ -987,8 +993,7 @@ class SLXDProvider(BaseProvider):
 
 # Shure Axient Digital "Command Strings" protocol -- same TCP 2202 bracket
 # syntax and AUDIO_MUTE/FREQUENCY parameters as ULX-D, but a richer SAMPLE
-# format and a direct-percent battery parameter. NOT hardware-verified (no
-# Axient Digital unit available to test against). Built from Shure's
+# format and a direct-percent battery parameter. Built from Shure's
 # published spec (Preliminary, May 2018):
 # https://content-files.shure.com/Pubs/AD4D/Axient_Digital_network_string_commands.pdf
 #   SAMPLE chNum ALL qual audBitmap audPeak audRms rfAntStats rfBitmapA
@@ -996,8 +1001,13 @@ class SLXDProvider(BaseProvider):
 #     (Quadversity=OFF, FD=OFF/FD-S); Quadversity and FD-C channels report
 #     additional antenna fields this doesn't attempt to parse. audPeak/
 #     rfRssiA are 0-120 raw, actual dBFS/dBm = raw-120 (same convention as
-#     SLX-D above).
-#   battery: TX_BATT_CHARGE_PERCENT (0-100 direct percent, 255=unknown).
+#     SLX-D above). rf is stored as that real dBm value (raw-120), reusing
+#     ULX-D/QLX-D's calibrated dBm display (rfDisplayPct()/rfIsLow()) --
+#     confirmed live against a real AD4D channel: rfRssiA=19 raw -> -101dBm,
+#     which is what this now reports, instead of an earlier version's flat
+#     raw/120 percent (16%) that had no real calibration behind it.
+#   battery: TX_BATT_CHARGE_PERCENT (0-100 direct percent, 255=unknown) --
+#     confirmed live (255 on the unit tested, correctly read as "unknown").
 class AxientDigitalProvider(BaseProvider):
     def __init__(self, ip, device_type, photo=None, channel=1):
         super().__init__(ip, device_type, photo)
@@ -1139,7 +1149,7 @@ class AxientDigitalProvider(BaseProvider):
                     continue
                 try:
                     self.metrics['audio'] = max(0, min(100, round(int(parts[5]) / 120 * 100)))
-                    self.metrics['rf'] = max(0, min(100, round(int(parts[9]) / 120 * 100)))
+                    self.metrics['rf'] = int(parts[9]) - 120
                 except (ValueError, IndexError):
                     pass
                 continue
