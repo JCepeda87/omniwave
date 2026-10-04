@@ -1,6 +1,7 @@
 
 import time
 import json
+import math
 import socket
 import queue
 import logging
@@ -289,13 +290,17 @@ class ShureProvider(BaseProvider):
                 continue
             if parts[0] == 'SAMPLE' and len(parts) >= 6:
                 # SAMPLE x ALL nn aaa eee -- nn=antenna LEDs, aaa=RF (000-115,
-                # subtract 128 for dBm), eee=audio level (000-050)
+                # subtract 128 for dBm), eee=audio level (000-050, per
+                # Shure's own ULX-D command-strings spec). Rescaled to 0-100
+                # here -- it used to be stored as the raw 0-50 value
+                # directly, which the UI's 0-100% bar renders as never
+                # filling past halfway even at genuinely loud input.
                 chan = parts[1]
                 if chan not in ('0', str(self.channel)):
                     continue
                 try:
                     self.metrics['rf'] = int(parts[4]) - 128
-                    self.metrics['audio'] = int(parts[5])
+                    self.metrics['audio'] = max(0, min(100, round(int(parts[5]) / 50 * 100)))
                 except (ValueError, IndexError):
                     pass
                 continue
@@ -574,7 +579,31 @@ class UHFRProvider(BaseProvider):
 # on the wire is implemented -- no battery/frequency/RF, since the P10T
 # exposes none of that here (it's a transmitter base station, not a
 # receiver, so those wouldn't mean the same thing even if they existed).
-PSM1000_ASSUMED_MAX = 1023  # no documented scale; treated as a rough 10-bit meter
+# Live measurement against real hardware (8 units, actual speech vs. quiet
+# background): raw AUDIO_IN_LVL values ranged from ~17,000 up to
+# ~3,548,184 -- a >150x spread within one ~20s capture. That rules out any
+# fixed linear ceiling: the old PSM1000_ASSUMED_MAX=1023 guess this
+# replaces was ~3,000x too low, which is why this metric always read a
+# pinned 100% regardless of actual level (every real reading clamped
+# straight to the assumed max). No single linear scale can represent that
+# much dynamic range sensibly, so this uses logarithmic (dB-style)
+# scaling instead -- the standard way real audio meters handle wide
+# dynamic range. Floor/ceiling below are picked with headroom around the
+# observed range, NOT calibrated against Shure's own internal formula:
+# that's undocumented, and Wireless Workbench's own live display for this
+# is an 8-segment LED ladder, not a number, so there's no exact reference
+# to solve against. This is an honest *relative* meter -- quiet reads
+# low, loud reads high, and it will never falsely peg at 100% for
+# ordinary speech the way the fixed ceiling did -- not a precise match to
+# WWB's internal calibration.
+PSM1000_AUDIO_LOG_FLOOR = 4.0    # log10(10,000) -- at/below this reads 0%
+PSM1000_AUDIO_LOG_CEILING = 6.7  # log10(~5,000,000) -- at/above this reads 100%
+
+def _psm1000_audio_pct(raw):
+    if raw <= 0:
+        return 0
+    pct = (math.log10(raw) - PSM1000_AUDIO_LOG_FLOOR) / (PSM1000_AUDIO_LOG_CEILING - PSM1000_AUDIO_LOG_FLOOR) * 100
+    return max(0, min(100, round(pct)))
 
 class PSM1000Provider(BaseProvider):
     def __init__(self, ip, device_type, photo=None, channel=1):
@@ -652,8 +681,7 @@ class PSM1000Provider(BaseProvider):
                         right = value
                 readings = [v for v in (left, right) if v is not None]
                 if readings:
-                    peak = min(max(readings), PSM1000_ASSUMED_MAX)
-                    self.metrics['audio'] = round(peak / PSM1000_ASSUMED_MAX * 100)
+                    self.metrics['audio'] = _psm1000_audio_pct(max(readings))
 
                 if not messages:
                     self._miss_count += 1
