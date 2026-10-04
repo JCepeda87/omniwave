@@ -9,5 +9,11 @@ config.json
 omniwave_history.db
 omniwave_history.db-journal
 .claude/scheduled_tasks.lock
+
+# Machine-specific dev-server launch config (absolute interpreter/project
+# paths) -- every machine needs its own, so this is intentionally
+# per-machine rather than shared/overwritten on every push. See
+# HANDOVER.md's "Environment" section for what to put in a fresh one.
+.claude/launch.json
 static/photos/*
 !static/photos/.gitkeep
