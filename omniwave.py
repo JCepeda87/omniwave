@@ -500,6 +500,10 @@ async def register_device_channels(ip, brand, dtype, name):
     the manual Add Device flow and background auto-discovery so a ULXD4Q or
     multi-channel PSM1000 shows up as N independent devices, not one."""
     channels = await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, discover_channels, ip, brand, dtype)
+    # Explicit (re-)registration always wins over a past removal -- clears
+    # any stale ignored_ips entry so this ip isn't silently blocked from
+    # auto-discovery forever after being deliberately brought back.
+    remove_ignored_ip(ip)
     added = []
     for channel in channels:
         key = device_key(ip, channel)
@@ -543,6 +547,9 @@ class DeviceHandler(RequestHandler):
             DeviceLayout.pop(key, None)
             DeviceListenStreams.pop(key, None)
             remove_device_from_config(dev.ip, dev.channel)
+            # Deliberately removed -- auto-discovery shouldn't bring it back
+            # on its own within the next scan (see run_auto_discovery_scan).
+            add_ignored_ip(dev.ip)
             self.write(json.dumps({'success': True}))
         else:
             self.set_status(404)
@@ -557,8 +564,10 @@ class RemoveAllDevicesHandler(RequestHandler):
     config.json."""
     async def post(self):
         keys = list(Devices.keys())
+        removed_ips = set()
         for key in keys:
             dev = Devices[key]
+            removed_ips.add(dev.ip)
             await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.disconnect)
             del Devices[key]
             DeviceNames.pop(key, None)
@@ -568,6 +577,9 @@ class RemoveAllDevicesHandler(RequestHandler):
             DeviceListenStreams.pop(key, None)
         remaining = [d for d in load_config() if d.get('location', DEFAULT_LOCATION) != ACTIVE_LOCATION]
         save_config(remaining)
+        # Deliberately removed -- see DeviceHandler.delete's same note.
+        for ip in removed_ips:
+            add_ignored_ip(ip)
         self.write(json.dumps({'success': True, 'removed': len(keys), 'location': ACTIVE_LOCATION}))
 
 class RenameHandler(RequestHandler):
@@ -1248,10 +1260,16 @@ AUTO_DISCOVERY_ENABLED = True
 AUTO_DISCOVERY_INTERVAL_SECONDS = 20
 
 def _ip_already_registered(ip):
-    """Devices is keyed by device_key(ip, channel), not bare ip -- so
-    "already added" now means "any channel of this ip is already added",
-    checked against the real ip each provider stores on itself."""
-    return any(dev.ip == ip for dev in Devices.values())
+    """Checked against the FULL saved config (every location), not just the
+    active location's in-memory Devices -- confirmed with the user that
+    locations here are logical boards on one shared network (e.g. WTL vs
+    HILLS), not separate venues with colliding private IP ranges, so the
+    same ip is always the same real device no matter which location it's
+    filed under. Checking only the active location let auto-discovery
+    re-add a device within ~20s of it being deleted or assigned to a
+    different location -- it looked "new" the moment it wasn't in the
+    currently-active board, even though it was still registered elsewhere."""
+    return any(d.get('ip') == ip for d in load_config())
 
 # Real per-unit channel discovery for multi-channel receivers (ULXD4Q, UR4D,
 # a dual PSM1000 P10T, ...): queries the device directly for which channels
@@ -1364,14 +1382,15 @@ def run_discovery_scan():
 
 def run_auto_discovery_scan():
     """Blocking; call via an executor. Finds live hosts, identifies each one
-    for real, and returns only ones not already in Devices. Unlike
-    run_discovery_scan() above, unidentified hosts are dropped here rather
-    than surfaced -- auto-add should never register a device under a
-    guessed type with no human reviewing it first."""
+    for real, and returns only ones not already registered (any location)
+    and not explicitly removed by the user. Unlike run_discovery_scan()
+    above, unidentified hosts are dropped here rather than surfaced --
+    auto-add should never register a device under a guessed type with no
+    human reviewing it first."""
     found = []
     for candidate in scan_subnet_all():
         ip = candidate['ip']
-        if _ip_already_registered(ip):
+        if _ip_already_registered(ip) or is_ignored_ip(ip):
             continue
         info = identify_device(ip)
         if info:
@@ -1384,7 +1403,7 @@ async def auto_discovery_tick():
             found = await IOLoop.current().run_in_executor(None, run_auto_discovery_scan)
             for f in found:
                 ip = f['ip']
-                if _ip_already_registered(ip):  # could've been added manually mid-scan
+                if _ip_already_registered(ip) or is_ignored_ip(ip):  # could've changed mid-scan
                     continue
                 name = f.get('name') or f"{f['label']} ({ip})"
                 added = await register_device_channels(ip, f['brand'], f['type'], name)
@@ -1637,7 +1656,7 @@ def load_full_config():
     DEFAULT_LOCATION here so nothing already on a user's board silently
     disappears when this ships."""
     if not os.path.exists(CONFIG_PATH):
-        return {'devices': [], 'active_location': DEFAULT_LOCATION, 'locations': [DEFAULT_LOCATION]}
+        return {'devices': [], 'active_location': DEFAULT_LOCATION, 'locations': [DEFAULT_LOCATION], 'ignored_ips': []}
     with open(CONFIG_PATH, 'r') as f:
         cfg = json.load(f)
     devices = cfg.get('devices', [])
@@ -1652,7 +1671,15 @@ def load_full_config():
     active = cfg.get('active_location', DEFAULT_LOCATION)
     if active not in locations:
         locations.append(active)
-    return {'devices': devices, 'active_location': active, 'locations': locations}
+    return {
+        'devices': devices, 'active_location': active, 'locations': locations,
+        # IPs explicitly removed by the user (Remove / Remove All) -- auto-
+        # discovery skips these so deleting a device actually sticks instead
+        # of it reappearing within 20s. Manual Add/Probe always bypasses
+        # this (explicit intent wins), and registering a device for real
+        # clears it from here -- see register_device_channels().
+        'ignored_ips': cfg.get('ignored_ips', []),
+    }
 
 def load_config():
     """Device list only (all locations), for callers that just need the
@@ -1674,6 +1701,24 @@ def save_locations_meta(active_location, locations):
     full['locations'] = locations
     with open(CONFIG_PATH, 'w') as f:
         json.dump(full, f, indent=2)
+
+def add_ignored_ip(ip):
+    full = load_full_config()
+    ignored = set(full['ignored_ips'])
+    ignored.add(ip)
+    full['ignored_ips'] = sorted(ignored)
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(full, f, indent=2)
+
+def remove_ignored_ip(ip):
+    full = load_full_config()
+    if ip in full['ignored_ips']:
+        full['ignored_ips'] = [i for i in full['ignored_ips'] if i != ip]
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(full, f, indent=2)
+
+def is_ignored_ip(ip):
+    return ip in load_full_config()['ignored_ips']
 
 # Every config.json entry is identified by (ip, channel, location), not
 # just (ip, channel) -- a multi-channel receiver has several entries
