@@ -200,6 +200,9 @@
   .inline-edit-input {
     flex: 1; min-width: 0; padding: 3px 6px; font-size: 13px;
   }
+  .zone-input {
+    width: 100%; padding: 3px 6px; font-size: 12px;
+  }
 
   .status-line { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; }
   .status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
@@ -543,10 +546,16 @@
     </div>
     <div class="device-filter-row">
       <label><input type="checkbox" id="danteOnlyToggle" onchange="toggleDanteFilter(this.checked)"> Show Dante-confirmed devices only</label>
+      <label style="margin-left:16px">Zone:
+        <select id="zoneFilterSelect" onchange="setZoneFilter(this.value)">
+          <option value="">All zones</option>
+        </select>
+      </label>
     </div>
     <div class="devices" id="devices">
       <div class="empty">No devices yet — add one above.</div>
     </div>
+    <datalist id="zoneList"></datalist>
   </div>
 
 <script>
@@ -573,6 +582,43 @@ function toggleDanteFilter(checked) {
   renderDevices(lastData);
 }
 
+// Zones sub-group devices within one location (e.g. "Stage" vs "Lobby")
+// without the weight of a whole separate location -- see DeviceZones in
+// omniwave.py. A zone exists exactly when something's assigned to it, so
+// the filter's own option list is rebuilt from whatever's actually on the
+// board each refresh rather than a separately-managed "known zones" list.
+let zoneFilter = '';
+function setZoneFilter(zone) {
+  zoneFilter = zone;
+  renderDevices(lastData);
+}
+function updateZoneFilterOptions(data) {
+  const sel = document.getElementById('zoneFilterSelect');
+  const zones = [...new Set(Object.values(data).map(d => d.zone).filter(Boolean))].sort();
+  const current = sel.value;
+  sel.innerHTML = '<option value="">All zones</option>' +
+    zones.map(z => `<option value="${escAttr(z)}">${z}</option>`).join('');
+  // Keep the user's selection if it's still a real option; a zone that's
+  // disappeared (last device in it moved/removed) silently falls back to
+  // "All zones" rather than filtering to an empty, confusing grid.
+  sel.value = zones.includes(current) ? current : '';
+  zoneFilter = sel.value;
+  // Autocomplete source for each card's zone input (see renderDeviceCard) --
+  // reusing the same distinct-zones list rather than tracking it twice.
+  document.getElementById('zoneList').innerHTML = zones.map(z => `<option value="${escAttr(z)}">`).join('');
+}
+
+async function saveZone(ip, zone) {
+  zone = zone.trim();
+  if ((lastData[ip] && lastData[ip].zone) === zone) return; // no change -- skip the round-trip
+  await fetch('/devices/zone', {
+    method: 'POST',
+    body: JSON.stringify({ ip, zone }),
+  });
+  if (lastData[ip]) lastData[ip].zone = zone;
+  updateZoneFilterOptions(lastData);
+}
+
 // Inline editing (name/frequency) uses a real input instead of prompt() --
 // a native dialog is one accidental "prevent this page from creating
 // additional dialogs" click away from silently no-op'ing forever, and some
@@ -581,6 +627,7 @@ function toggleDanteFilter(checked) {
 // can't wipe out an in-progress, unsaved edit.
 const editingName = new Set();
 const editingFreq = new Set();
+const editingZone = new Set(); // ip currently focused in its zone input -- see saveZone()
 
 function escAttr(str) {
   return String(str).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
@@ -1216,7 +1263,7 @@ function renderReplayView() {
   renderStats(merged);
   renderAlertsFeed(merged);
   renderRfPlot(merged);
-  if (editingName.size === 0 && editingFreq.size === 0 && streamConfigOpen.size === 0) {
+  if (editingName.size === 0 && editingFreq.size === 0 && editingZone.size === 0 && streamConfigOpen.size === 0) {
     renderDevices(merged);
   }
 }
@@ -1280,19 +1327,25 @@ async function refresh() {
   // startNameEdit/cancelNameEdit/saveNameEdit (and the frequency equivalents)
   // call renderDevices() directly instead, so opening/closing the editor
   // itself always renders immediately regardless of this guard.
-  if (editingName.size === 0 && editingFreq.size === 0 && streamConfigOpen.size === 0) {
+  if (editingName.size === 0 && editingFreq.size === 0 && editingZone.size === 0 && streamConfigOpen.size === 0) {
     renderDevices(data);
   }
 }
 
 function renderDevices(data) {
+  updateZoneFilterOptions(data);
   let ips = Object.keys(data);
   if (danteOnlyFilter) {
     ips = ips.filter(ip => data[ip].dante_status && data[ip].dante_status.interface_present);
   }
+  if (zoneFilter) {
+    ips = ips.filter(ip => data[ip].zone === zoneFilter);
+  }
   if (ips.length === 0) {
     devicesEl.innerHTML = danteOnlyFilter
       ? '<div class="empty">No devices with a confirmed Dante interface right now -- a device needs to be connected at least once for this to be known.</div>'
+      : zoneFilter
+      ? `<div class="empty">No devices in zone "${zoneFilter}" right now.</div>`
       : '<div class="empty">No devices yet — add one above.</div>';
     return;
   }
@@ -1399,6 +1452,12 @@ function renderDeviceCard(ip, data) {
               <div class="device-name-row">${nameRow}${roleBadge}${danteBadge}</div>
               <div class="device-ip">${ip} · ${d.type || ''}${d.channel ? ' · ch ' + d.channel : ''}</div>
               <div class="device-freq-row device-meta">${freqRow}</div>
+              <div class="device-meta">
+                <input type="text" class="zone-input" list="zoneList" placeholder="Zone (e.g. Stage)" value="${escAttr(d.zone || '')}"
+                  onfocus="editingZone.add('${ip}')"
+                  onkeydown="if(event.key==='Enter'){this.blur();}"
+                  onblur="editingZone.delete('${ip}'); saveZone('${ip}', this.value)">
+              </div>
             </div>
           </div>
           <div class="status-line ${d.status}"><span class="status-dot ${d.status}"></span>${d.status}</div>

@@ -59,6 +59,14 @@ DeviceAssignedUsers = {}  # key -> name of the person currently using the device
 DeviceFrequencies = {}  # key -> assigned carrier frequency in MHz
 DeviceLayout = {}  # key -> {'size': 'sm'|'md'|'lg', 'order': int} -- User Board card layout, admin-only
 DeviceListenStreams = {}  # key -> AES67 stream dict (multicast_addr/port/payload_type/encoding/sample_rate/channels)
+# key -> zone name (e.g. "Stage", "Lobby") -- a lighter-weight sub-grouping
+# WITHIN one location, for a rig too large to eyeball as one flat list but
+# not warranting a whole separate location (which fully disconnects and
+# reconnects a different device set -- see switch_active_location). Purely
+# organizational/filtering, never touches hardware, so unlike DeviceNames
+# there's no separate "known zones" list to manage: a zone exists exactly
+# when at least one device in the active location is assigned to it.
+DeviceZones = {}
 
 # One optional RF Venue Spectrum Recorder, board-wide rather than
 # per-location (like ACTIVE_LOCATION, unlike Devices) -- a venue typically
@@ -282,6 +290,7 @@ class DataHandler(RequestHandler):
         for key, dev in Devices.items():
             entry = dev.get_json()
             entry['name'] = DeviceNames.get(key, '')
+            entry['zone'] = DeviceZones.get(key, '')
             entry['assigned_user'] = DeviceAssignedUsers.get(key, '')
             layout = DeviceLayout.get(key, {})
             entry['card_size'] = layout.get('size', 'md')
@@ -567,6 +576,7 @@ class DeviceHandler(RequestHandler):
             await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.disconnect)
             del Devices[key]
             DeviceNames.pop(key, None)
+            DeviceZones.pop(key, None)
             DeviceAssignedUsers.pop(key, None)
             DeviceFrequencies.pop(key, None)
             DeviceLayout.pop(key, None)
@@ -596,6 +606,7 @@ class RemoveAllDevicesHandler(RequestHandler):
             await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.disconnect)
             del Devices[key]
             DeviceNames.pop(key, None)
+            DeviceZones.pop(key, None)
             DeviceAssignedUsers.pop(key, None)
             DeviceFrequencies.pop(key, None)
             DeviceLayout.pop(key, None)
@@ -623,6 +634,23 @@ class RenameHandler(RequestHandler):
         dev = Devices[key]
         update_device_name_in_config(dev.ip, dev.channel, name)
         self.write(json.dumps({'success': True, 'ip': key, 'name': name}))
+
+class AssignZoneHandler(RequestHandler):
+    """Sub-groups a device within the active location (e.g. "Stage",
+    "Lobby") -- purely organizational, never touches hardware, so (unlike
+    RenameHandler) this is safe to leave reachable from the User Board too
+    if that's ever wanted. Blank clears it back to unassigned."""
+    def post(self):
+        params = json.loads(self.request.body)
+        key = params.get('ip')  # device_key(ip, channel)
+        zone = (params.get('zone') or '').strip()
+        if not key or key not in Devices:
+            self.set_status(404)
+            return
+        DeviceZones[key] = zone
+        dev = Devices[key]
+        update_device_zone_in_config(dev.ip, dev.channel, zone)
+        self.write(json.dumps({'success': True, 'ip': key, 'zone': zone}))
 
 class AssignUserHandler(RequestHandler):
     """Sets who's currently using a device (shown over the photo on the User
@@ -2021,6 +2049,13 @@ def update_device_name_in_config(ip, channel, name):
             d['name'] = name
     save_config(devices)
 
+def update_device_zone_in_config(ip, channel, zone):
+    devices = load_config()
+    for d in devices:
+        if _same_device(d, ip, channel):
+            d['zone'] = zone
+    save_config(devices)
+
 def update_device_frequency_in_config(ip, channel, freq):
     devices = load_config()
     for d in devices:
@@ -2077,6 +2112,7 @@ async def _connect_loaded_device(key, dev, dev_cfg, idx):
     await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, dev.connect)
     dev.photo = dev_cfg.get('photo')
     DeviceNames[key] = dev_cfg.get('name', '')
+    DeviceZones[key] = dev_cfg.get('zone', '')
     DeviceAssignedUsers[key] = dev_cfg.get('assigned_user', '')
     DeviceLayout[key] = {
         'size': dev_cfg.get('card_size', 'md'),
@@ -2122,6 +2158,7 @@ async def _unload_all_devices():
         ))
     Devices.clear()
     DeviceNames.clear()
+    DeviceZones.clear()
     DeviceAssignedUsers.clear()
     DeviceFrequencies.clear()
     DeviceLayout.clear()
@@ -2183,6 +2220,7 @@ def main():
         (r'/devices/remove-all', RemoveAllDevicesHandler),
         (r'/locations', LocationsHandler),
         (r'/devices/rename', RenameHandler),
+        (r'/devices/zone', AssignZoneHandler),
         (r'/devices/assign-user', AssignUserHandler),
         (r'/devices/card-size', CardSizeHandler),
         (r'/devices/visibility', CardVisibilityHandler),
