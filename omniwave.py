@@ -13,6 +13,7 @@ import asyncio
 import mimetypes
 import requests
 import subprocess
+import struct
 import threading
 import tornado.websocket
 from concurrent.futures import ThreadPoolExecutor
@@ -883,6 +884,22 @@ def get_local_subnets():
         return []
     return _parse_ifconfig_subnets(output)
 
+IFCONFIG_INET_LINE_RE = re.compile(r'^\s*inet\s+(\d+\.\d+\.\d+\.\d+)\s+netmask', re.MULTILINE)
+
+def get_local_ips():
+    """This machine's own IPv4 addresses (every interface, not just the
+    default route) -- used to filter passive-discovery results (see
+    ShureDiscoveryListener): multicast delivers to every socket that joined
+    the group on the LAN segment, including ones on this same host, so
+    something else on this Mac sending real SSDP/SLP traffic (confirmed
+    live: happens on its own, nothing to do with this app) would otherwise
+    show up as a 'discovered device' that's actually just this computer."""
+    try:
+        output = subprocess.run(['ifconfig'], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return {m.group(1) for m in IFCONFIG_INET_LINE_RE.finditer(output)}
+
 def probe_host(ip, port):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1044,15 +1061,129 @@ def mdns_discover_sennheiser_ips():
 
 def scan_subnet_all():
     """Blocking; call via an executor. TCP + UDP port-probe candidates plus
-    mDNS/Bonjour-discovered ones (see mdns_discover_sennheiser_ips() above),
-    deduplicated by IP -- an explicit port-probe result wins if a host
-    somehow shows up in both."""
+    mDNS/Bonjour-discovered ones (see mdns_discover_sennheiser_ips()) plus
+    Shure-multicast passively-discovered ones (see ShureDiscoveryListener,
+    below), deduplicated by IP -- an explicit port-probe result wins if a
+    host somehow shows up in more than one of these (each source sets
+    'source' so callers can still tell a passive-only/mDNS-only hit apart
+    from a directly-probed one)."""
     combined = {}
+    for ip in ShureDiscoveryListener.drain():
+        combined[ip] = {'ip': ip, 'brand': 'shure', 'port': None, 'source': 'passive'}
     for ip in mdns_discover_sennheiser_ips():
-        combined[ip] = {'ip': ip, 'brand': 'sennheiser', 'port': None}
+        combined[ip] = {'ip': ip, 'brand': 'sennheiser', 'port': None, 'source': 'mdns'}
     for c in scan_subnet_udp() + scan_subnet():
-        combined[c['ip']] = c
+        combined[c['ip']] = {**c, 'source': 'probe'}
     return list(combined.values())
+
+# Passive discovery -- a third, fundamentally different discovery path from
+# every probe_host_* function and mdns_discover_sennheiser_ips() above.
+# Those are all *active*: something here sends a packet straight at a
+# specific IP (or a targeted mDNS query) and waits for a reply. This instead
+# just joins the well-known multicast groups Shure's "Shure Control" device
+# family (ULX-D/QLX-D-class receivers, Axient Digital, PSM1000, SBC
+# chargers) use to announce themselves on their own, unprompted, and
+# records whoever's been talking there -- confirmed real, not guessed, from
+# Shure's own published WWB6 Ports and Protocol Information:
+# https://service.shure.com/articles/en_US/Knowledge/wwb6-ports-and-protocol-information
+#   239.255.255.250:1900 -- SSDP ("Service Discovery")
+#   239.255.254.253:8427 -- Shure's own "Multicast SLP" ("Required for
+#     service discovery")
+# Same pattern aes67.SAPListener already uses for AES67/Dante stream
+# discovery (join a well-known multicast group, let devices announce
+# themselves instead of being asked) -- this is that same idea applied to
+# Shure's own discovery channels rather than Dante's. It catches two real
+# cases the active probes above can miss entirely: a device that only just
+# powered on or reconnected (no need to wait for the next scan cycle to
+# happen to probe it), and a device on a network whose policy silently
+# drops unicast traffic from a client it doesn't recognize while still
+# letting ambient multicast through -- the exact pattern already confirmed
+# live this session against a real Sennheiser EM6000 over mDNS, now covered
+# for Shure's own discovery channels too. The payload is never parsed --
+# the mere fact a host sent *anything* to one of these addresses is itself
+# the signal; identify_device() (run on every candidate from every
+# discovery path, including this one) is what actually confirms what the
+# device really is, so a false positive here (some unrelated SSDP-chatty
+# device, e.g. a smart TV) costs one extra, cheap identify_device() call
+# and nothing more.
+SHURE_DISCOVERY_GROUPS = [
+    ('239.255.255.250', 1900),  # SSDP
+    ('239.255.254.253', 8427),  # Shure Multicast SLP
+]
+
+OWN_IPS_REFRESH_SECONDS = 30
+
+class ShureDiscoveryListener:
+    """One instance per multicast group (see SHURE_DISCOVERY_GROUPS) --
+    joins it and records the source IP of every packet received, until the
+    process exits. discovered_ips is shared (class-level) across every
+    instance since callers just want "everything heard on any group"."""
+    discovered_ips = set()
+    _lock = threading.Lock()
+    _own_ips = frozenset()
+    _own_ips_checked_at = 0.0
+
+    @classmethod
+    def _is_own_ip(cls, ip):
+        # Cached rather than shelled out to ifconfig per packet -- a busy
+        # multicast group (other local software chattering on it, see the
+        # module comment above) could mean many packets a second.
+        now = time.time()
+        if now - cls._own_ips_checked_at > OWN_IPS_REFRESH_SECONDS:
+            cls._own_ips = frozenset(get_local_ips())
+            cls._own_ips_checked_at = now
+        return ip in cls._own_ips
+
+    def __init__(self, group, port):
+        self.group = group
+        self.port = port
+        self._sock = None
+
+    def start(self):
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Lets this coexist with other software on the same machine
+            # also listening on this same well-known port (e.g. Wireless
+            # Workbench running alongside this app) -- best-effort, not
+            # available on every platform.
+            if hasattr(socket, 'SO_REUSEPORT'):
+                try: self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError: pass
+            self._sock.bind(('', self.port))
+            mreq = struct.pack('4sL', socket.inet_aton(self.group), socket.INADDR_ANY)
+            self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            self._sock.settimeout(1.0)
+        except OSError as e:
+            print(f"Shure discovery: couldn't join {self.group}:{self.port}: {e}")
+            self._sock = None
+            return False
+        threading.Thread(target=self._run, daemon=True).start()
+        return True
+
+    def _run(self):
+        while self._sock:
+            try:
+                _data, (ip, _src_port) = self._sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if self._is_own_ip(ip):
+                continue
+            with self._lock:
+                ShureDiscoveryListener.discovered_ips.add(ip)
+
+    @classmethod
+    def drain(cls):
+        with cls._lock:
+            ips = list(cls.discovered_ips)
+            cls.discovered_ips.clear()
+        return ips
+
+def start_passive_discovery():
+    for group, port in SHURE_DISCOVERY_GROUPS:
+        ShureDiscoveryListener(group, port).start()
 
 class DiscoverHandler(RequestHandler):
     async def get(self):
@@ -1405,20 +1536,22 @@ def run_discovery_scan():
         info = identify_device(ip)
         if info:
             found.append({'ip': ip, 'identified': True, **info})
-        elif candidate['port'] is None:
-            # Found only via mDNS/Bonjour self-announcement (see
-            # mdns_discover_sennheiser_ips()), not by a port responding to a
-            # direct query -- a real, specific pattern confirmed live this
-            # session: the device genuinely publishes itself over multicast
-            # but silently ignores unicast queries from this client, most
-            # likely a switch/VLAN policy restricting which hosts it'll
-            # actually talk to (not a device problem -- a different,
-            # already-trusted PC on the same network can usually still
-            # reach it fine).
+        elif candidate.get('source') in ('mdns', 'passive'):
+            # Found only via self-announcement -- mDNS/Bonjour
+            # (mdns_discover_sennheiser_ips()) or Shure's own discovery
+            # multicast groups (drain_passive_discovered_ips()) -- not by a
+            # port responding to a direct query. A real, specific pattern
+            # confirmed live this session: a device can genuinely announce
+            # itself over multicast while silently ignoring unicast queries
+            # from this client, most likely a switch/VLAN policy
+            # restricting which hosts it'll actually talk to directly (not
+            # a device problem -- a different, already-trusted PC on the
+            # same network can usually still reach it fine).
+            via = 'Bonjour/mDNS' if candidate['source'] == 'mdns' else "Shure's discovery multicast (SSDP/SLP)"
             found.append({
                 'ip': ip, 'identified': False, 'type': None,
                 'brand': candidate['brand'],
-                'label': "Announces itself via Bonjour/mDNS but isn't answering direct queries -- likely network policy blocking this computer specifically, not a device problem",
+                'label': f"Announces itself via {via} but isn't answering direct queries -- likely network policy blocking this computer specifically, not a device problem",
                 'name': None,
             })
         else:
@@ -1999,6 +2132,7 @@ def main():
     IOLoop.current().run_sync(lambda: _load_location(ACTIVE_LOCATION, full_cfg['devices']))
 
     _sap_listener.start()
+    start_passive_discovery()
     IOLoop.current().spawn_callback(poll_devices)
     IOLoop.current().spawn_callback(auto_discovery_tick)
     IOLoop.current().spawn_callback(prune_metrics_tick)
