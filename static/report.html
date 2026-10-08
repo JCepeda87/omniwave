@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OmniWave — Report</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0c0e;
+    --panel: #16181c;
+    --panel-raised: #1c1f24;
+    --text: #f0f1f3;
+    --muted: #9aa0a8;
+    --border: #2a2e34;
+    --accent: #5b8def;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 20px;
+  }
+  .app-header {
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 12px; margin-bottom: 18px;
+  }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  .subtitle { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .updated { color: var(--muted); font-size: 11px; }
+  .readonly-badge {
+    color: var(--muted); font-size: 11px; border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 9px;
+  }
+
+  .device-group-header {
+    font-size: 12px; font-weight: 700; letter-spacing: .04em; color: var(--muted);
+    text-transform: uppercase; margin: 18px 0 8px; display: flex; align-items: center; gap: 8px;
+  }
+  .device-group-header:first-child { margin-top: 0; }
+  .device-group-count {
+    background: var(--panel-raised); border-radius: 10px; padding: 1px 8px; font-size: 11px;
+  }
+  .board { display: flex; flex-wrap: wrap; gap: 16px; }
+  .empty { color: var(--muted); font-size: 14px; padding: 40px; text-align: center; }
+
+  .ucard {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 12px 14px; width: 230px; flex: 0 0 auto;
+  }
+  .ucard.has-alert { border-color: var(--bad); box-shadow: 0 0 0 1px var(--bad); }
+  .ualert-banner {
+    background: var(--bad); color: #2a0a0a; font-size: 11px; font-weight: 700;
+    padding: 4px 10px; text-align: center; margin: -12px -14px 10px; border-radius: 14px 14px 0 0;
+  }
+  .uhead-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+  .uname { font-weight: 700; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ustatus-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+  .ustatus-dot.CONNECTED { background: var(--ok); }
+  .ustatus-dot.DISCONNECTED { background: var(--bad); }
+  .umeta { color: var(--muted); font-size: 11px; margin: 2px 0 2px; }
+  .uassigned { color: var(--text); font-size: 12px; margin-bottom: 8px; }
+  .uassigned.placeholder { color: var(--muted); font-style: italic; }
+
+  .umetric { display: flex; align-items: center; gap: 6px; font-size: 11px; margin-top: 5px; }
+  .umetric .uicon { width: 14px; text-align: center; flex-shrink: 0; }
+  .ubar { flex: 1; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  .ubar-fill { height: 100%; border-radius: 3px; background: var(--ok); transition: width .3s; }
+  .umetric.low .ubar-fill { background: var(--bad); }
+  .umetric.low .uval { color: var(--bad); }
+  .uval { min-width: 36px; text-align: right; flex-shrink: 0; font-weight: 600; }
+</style>
+</head>
+<body>
+  <div class="app-header">
+    <div>
+      <h1>OmniWave</h1>
+      <div class="subtitle" id="subtitle">Live device status (read-only)</div>
+    </div>
+    <div style="display:flex; align-items:center; gap:10px">
+      <span class="readonly-badge">👁 Read-only</span>
+      <div class="updated" id="statUpdated">—</div>
+    </div>
+  </div>
+
+  <div class="board" id="board"></div>
+
+<script>
+// Deliberately no write endpoints anywhere in this page -- see
+// ReportHandler's comment in omniwave.py for why. Everything below only
+// ever reads /data, already the same open, unauthenticated endpoint the
+// admin dashboard and User Board use -- the token on this page's own URL
+// is what's new, not any added protection on the data itself.
+
+function isLow(key, val) {
+  if (val === undefined || val === null) return false;
+  if (key === 'batt') return val < 20;
+  // rf isn't one consistent unit across providers: some report an
+  // already-0-100 quality percentage, others (ULX-D/QLX-D/Axient Digital)
+  // report a raw antenna dBm value directly, often negative. Treating a
+  // dBm reading as if it were a 0-100 percentage (this file's previous
+  // version, and user.html's current one) flags every one of those
+  // permanently "low" regardless of real signal -- see rfDisplayPct below.
+  if (key === 'rf') return val < 0 ? val < -85 : val < 30;
+  return false;
+}
+
+// Same -90..-20 dBm display window as the admin dashboard's rfDisplayPct()
+// (static/index.html) -- a reasonable professional-wireless assumption for
+// *bar width* only; the raw dBm number itself is always shown as-is.
+function rfDisplayPct(val) {
+  if (val === undefined || val === null) return null;
+  if (val < 0) return Math.max(0, Math.min(100, Math.round((val + 90) / 70 * 100)));
+  return Math.max(0, Math.min(100, val));
+}
+
+function formatRuntime(mins) {
+  if (mins === undefined || mins === null) return null;
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return h > 0 ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m`;
+}
+
+function metricRow(icon, key, val, label, valueText) {
+  const pct = (val === undefined || val === null) ? 0 : (key === 'rf' ? rfDisplayPct(val) : Math.max(0, Math.min(100, val)));
+  const low = isLow(key, val);
+  const text = valueText || (val !== undefined && val !== null ? val + (key === 'rf' && val < 0 ? '' : '%') : '—');
+  return `
+    <div class="umetric ${low ? 'low' : ''}" title="${label}">
+      <span class="uicon">${icon}</span>
+      <div class="ubar"><div class="ubar-fill" style="width:${pct}%"></div></div>
+      <span class="uval">${text}</span>
+    </div>`;
+}
+
+const TYPE_LABELS = {
+  ulxd: 'ULX-D', qlxd: 'QLX-D', 'slxd-plus': 'SLX-D', 'axient-digital': 'Axient Digital',
+  'uhf-r': 'UHF-R', psm1000: 'PSM1000 (IEM)', mxw: 'MXW', ewdx: 'EW-DX', 'ewdx-sscv2': 'EW-DX (SSCv2)',
+};
+function typeLabel(type) {
+  return TYPE_LABELS[type] || (type || 'Unknown').replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+async function refresh() {
+  let data;
+  try {
+    data = await fetch('/data').then(r => r.json());
+  } catch (e) { return; }
+  document.getElementById('statUpdated').textContent = new Date().toLocaleTimeString();
+  renderBoard(data);
+}
+
+function renderBoard(data) {
+  const boardEl = document.getElementById('board');
+  const ips = Object.keys(data);
+  if (ips.length === 0) {
+    boardEl.innerHTML = '<div class="empty">No devices on this board right now.</div>';
+    return;
+  }
+  const groups = new Map();
+  ips.forEach(ip => {
+    const type = data[ip].type || 'unknown';
+    if (!groups.has(type)) groups.set(type, []);
+    groups.get(type).push(ip);
+  });
+  const sortedGroups = [...groups.entries()]
+    .map(([type, group]) => ({ type, label: typeLabel(type), ips: group }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+
+  boardEl.innerHTML = sortedGroups.map(group => `
+    <div class="device-group-header">${group.label} <span class="device-group-count">${group.ips.length}</span></div>
+    <div class="board">${group.ips.map(ip => renderCard(ip, data)).join('')}</div>
+  `).join('');
+}
+
+function renderCard(ip, data) {
+  const d = data[ip];
+  const m = d.metrics || {};
+  const hasUser = d.assigned_user && d.assigned_user.trim().length > 0;
+  const unitName = d.name || d.type || ip;
+  const hasAlert = d.alerts && d.alerts.length > 0;
+  const alertBanner = hasAlert ? `<div class="ualert-banner">⚠ ${d.alerts[d.alerts.length - 1]}</div>` : '';
+  return `
+    <div class="ucard ${hasAlert ? 'has-alert' : ''}">
+      ${alertBanner}
+      <div class="uhead-row">
+        <span class="uname">${unitName}</span>
+        <span class="ustatus-dot ${d.status}" title="${d.status}"></span>
+      </div>
+      <div class="umeta">${d.type || ''}${d.channel ? ' · ch ' + d.channel : ''}${d.zone ? ' · ' + d.zone : ''}${d.frequency_mhz != null ? ' · ' + d.frequency_mhz.toFixed(3) + ' MHz' : ''}</div>
+      <div class="uassigned ${hasUser ? '' : 'placeholder'}">${hasUser ? d.assigned_user : 'Unassigned'}</div>
+      ${metricRow('🔋', 'batt', m.batt, 'Battery', formatRuntime(m.batt_minutes))}
+      ${metricRow('📶', 'rf', m.rf, 'RF signal', m.rf != null ? (m.rf < 0 ? m.rf + ' dBm' : m.rf + '%') : null)}
+      ${metricRow('🔊', 'audio', m.audio, 'Audio')}
+    </div>`;
+}
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

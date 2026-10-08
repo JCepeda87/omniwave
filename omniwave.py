@@ -14,6 +14,7 @@ import mimetypes
 import requests
 import subprocess
 import struct
+import secrets
 import threading
 import tornado.websocket
 from concurrent.futures import ThreadPoolExecutor
@@ -510,6 +511,44 @@ class UserIndexHandler(RequestHandler):
     def get(self):
         with open(os.path.join(os.path.abspath('.'), 'static', 'user.html'), 'rb') as f:
             self.write(f.read())
+
+class ReportHandler(RequestHandler):
+    """A genuinely read-only view -- unlike UserIndexHandler (which still
+    lets whoever's looking at it claim a device and upload a photo),
+    report.html has no write endpoints wired into it at all, and unlike
+    every other page in this app, getting to it requires a real token (see
+    create_report_token()) rather than just knowing/guessing a path. Meant
+    for handing a link to someone who should see live status -- FOH, a
+    producer, a client -- without handing them the admin board or even the
+    User Board's limited self-service controls."""
+    def get(self, token):
+        if not is_valid_report_token(token):
+            self.set_status(404)
+            return
+        with open(os.path.join(os.path.abspath('.'), 'static', 'report.html'), 'rb') as f:
+            self.write(f.read())
+
+class ReportTokensHandler(RequestHandler):
+    """Create/list/revoke the tokens ReportHandler checks -- admin-only in
+    intent (same as every other management endpoint here; see
+    HANDOVER.md's security-posture note -- nothing in this app actually
+    enforces that distinction today)."""
+    def get(self):
+        self.write(json.dumps({'tokens': load_full_config()['report_tokens']}))
+
+    def post(self):
+        params = json.loads(self.request.body)
+        label = (params.get('label') or '').strip()
+        entry = create_report_token(label)
+        self.write(json.dumps(entry))
+
+    def delete(self):
+        token = self.get_argument('token', None)
+        if not token:
+            self.set_status(400)
+            return
+        revoke_report_token(token)
+        self.write(json.dumps({'success': True}))
 
 class StaticHandler(RequestHandler):
     def get(self, path):
@@ -1940,7 +1979,7 @@ def load_full_config():
     disappears when this ships."""
     if not os.path.exists(CONFIG_PATH):
         return {'devices': [], 'active_location': DEFAULT_LOCATION, 'locations': [DEFAULT_LOCATION],
-                'ignored_ips': [], 'spectrum_recorder_ip': None}
+                'ignored_ips': [], 'spectrum_recorder_ip': None, 'report_tokens': []}
     with open(CONFIG_PATH, 'r') as f:
         cfg = json.load(f)
     devices = cfg.get('devices', [])
@@ -1965,6 +2004,10 @@ def load_full_config():
         'ignored_ips': cfg.get('ignored_ips', []),
         # Board-wide, not per-location -- see SPECTRUM_RECORDER's comment.
         'spectrum_recorder_ip': cfg.get('spectrum_recorder_ip'),
+        # Revocable links for the read-only shareable report -- see
+        # ReportHandler/ReportTokensHandler. Each entry:
+        # {token, label, created_at}.
+        'report_tokens': cfg.get('report_tokens', []),
     }
 
 def load_config():
@@ -2011,6 +2054,31 @@ def save_spectrum_recorder_ip(ip):
     full['spectrum_recorder_ip'] = ip
     with open(CONFIG_PATH, 'w') as f:
         json.dump(full, f, indent=2)
+
+def create_report_token(label):
+    full = load_full_config()
+    # 32 url-safe chars from a CSPRNG (secrets, not random) -- this is the
+    # only thing standing between "link I handed someone" and "anyone who
+    # guesses a path", since nothing else in this app is authenticated
+    # (see HANDOVER.md's security-posture note). Not a claim that /report
+    # is cryptographically hardened overall: /data itself stays exactly as
+    # open as it already is for the admin/User Board, this only gates the
+    # read-only report *page* behind a real token instead of a guessable path.
+    token = secrets.token_urlsafe(24)
+    entry = {'token': token, 'label': label or '', 'created_at': time.time()}
+    full['report_tokens'].append(entry)
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(full, f, indent=2)
+    return entry
+
+def revoke_report_token(token):
+    full = load_full_config()
+    full['report_tokens'] = [t for t in full['report_tokens'] if t['token'] != token]
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(full, f, indent=2)
+
+def is_valid_report_token(token):
+    return any(t['token'] == token for t in load_full_config()['report_tokens'])
 
 # Every config.json entry is identified by (ip, channel, location), not
 # just (ip, channel) -- a multi-channel receiver has several entries
@@ -2207,6 +2275,8 @@ def main():
     app = Application([
         (r'/', IndexHandler),
         (r'/user', UserIndexHandler),
+        (r'/report/([^/]+)', ReportHandler),
+        (r'/report-tokens', ReportTokensHandler),
         (r'/data', DataHandler),
         (r'/analytics', AnalyticsHandler),
         (r'/analytics/snapshot', SnapshotHandler),

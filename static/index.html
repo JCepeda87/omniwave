@@ -539,6 +539,22 @@
     </div>
   </details>
 
+  <details class="panel">
+    <summary>Shareable Report</summary>
+    <div class="details-body">
+      <div class="device-meta" style="margin-bottom:10px">
+        A genuinely read-only live status page -- no device controls at all, unlike the User Board -- for
+        handing to FOH, a producer, or a client. Each link below has its own revocable token; the page itself
+        reads the same live data this dashboard does, just presented read-only and gated behind that token.
+      </div>
+      <form class="add-device" id="reportTokenForm">
+        <input name="label" id="reportTokenLabel" placeholder="Label (e.g. FOH tonight)">
+        <button type="submit">Create Link</button>
+      </form>
+      <div id="reportTokenList" style="margin-top:10px"></div>
+    </div>
+  </details>
+
   <div class="panel">
     <div class="panel-head-row">
       <h2>Devices</h2>
@@ -923,6 +939,60 @@ async function disconnectSpectrumRecorder() {
   document.getElementById('spectrumRecorderForm').reset();
   renderSpectrumRecorderStatus(res);
 }
+
+function reportLinkUrl(token) {
+  return `${location.origin}/report/${token}`;
+}
+
+async function loadReportTokens() {
+  const res = await fetch('/report-tokens').then(r => r.json());
+  renderReportTokens(res.tokens || []);
+}
+
+function renderReportTokens(tokens) {
+  const el = document.getElementById('reportTokenList');
+  if (!tokens.length) {
+    el.innerHTML = '<div class="device-meta">No report links yet -- create one above.</div>';
+    return;
+  }
+  el.innerHTML = tokens.map(t => `
+    <div class="discovery-row">
+      <div>
+        <div class="device-name">${t.label || '(untitled)'}</div>
+        <div class="device-meta">${reportLinkUrl(t.token)} · created ${new Date(t.created_at * 1000).toLocaleDateString()}</div>
+      </div>
+      <button class="secondary" onclick="copyReportLink('${t.token}', this)">Copy Link</button>
+      <button class="danger" onclick="revokeReportToken('${t.token}')">Revoke</button>
+    </div>`).join('');
+}
+
+async function copyReportLink(token, btn) {
+  const url = reportLinkUrl(token);
+  try {
+    await navigator.clipboard.writeText(url);
+    const original = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = original; }, 1500);
+  } catch (e) {
+    prompt('Copy this link:', url);
+  }
+}
+
+async function revokeReportToken(token) {
+  await fetch('/report-tokens?token=' + encodeURIComponent(token), { method: 'DELETE' });
+  loadReportTokens();
+}
+
+document.getElementById('reportTokenForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const label = document.getElementById('reportTokenLabel').value.trim();
+  await fetch('/report-tokens', {
+    method: 'POST',
+    body: JSON.stringify({ label }),
+  });
+  e.target.reset();
+  loadReportTokens();
+});
 
 function renderSpectrum(spectrum) {
   if (!spectrum || !spectrum.length) return '';
@@ -2261,6 +2331,7 @@ loadLocations();
 loadRegions();
 loadAutoDiscoveryState();
 loadSpectrumRecorder();
+loadReportTokens();
 renderScanExclusionChips();
 renderManualExclusionChips();
 refresh();
