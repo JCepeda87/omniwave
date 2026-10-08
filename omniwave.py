@@ -25,6 +25,7 @@ from providers import (ShureProvider, SennheiserProvider, UHFRProvider, PSM1000P
                        EWDX_PRODUCT_CHANNELS)
 import aes67
 import spectrum_planner
+import rfvenue
 
 # All blocking device I/O (poll, send_command, connect) runs here instead of
 # on the main IOLoop thread, so one slow/unresponsive device -- or a command
@@ -58,6 +59,13 @@ DeviceAssignedUsers = {}  # key -> name of the person currently using the device
 DeviceFrequencies = {}  # key -> assigned carrier frequency in MHz
 DeviceLayout = {}  # key -> {'size': 'sm'|'md'|'lg', 'order': int} -- User Board card layout, admin-only
 DeviceListenStreams = {}  # key -> AES67 stream dict (multicast_addr/port/payload_type/encoding/sample_rate/channels)
+
+# One optional RF Venue Spectrum Recorder, board-wide rather than
+# per-location (like ACTIVE_LOCATION, unlike Devices) -- a venue typically
+# has at most one of these physical units regardless of how many logical
+# location boards it's organized into. None until configured via
+# SpectrumRecorderHandler; see rfvenue.py for what it actually does.
+SPECTRUM_RECORDER = None
 
 # This app moves between venues constantly (see HANDOVER.md), and a flat
 # device list accumulates every unit ever seen at every venue -- useless for
@@ -1793,6 +1801,63 @@ class ScanExclusionsHandler(RequestHandler):
         ranges = spectrum_planner.exclusions_from_scan(spectrum, threshold)
         self.write(json.dumps({'excluded_ranges': ranges}))
 
+class SpectrumRecorderHandler(RequestHandler):
+    """Configure and read an RF Venue Spectrum Recorder -- a standalone
+    scanner, board-wide like ACTIVE_LOCATION rather than one of
+    Devices/DeviceNames/etc. See rfvenue.py for what actually happens on
+    connect/poll and SPECTRUM_RECORDER's comment for why this is global."""
+    def get(self):
+        if SPECTRUM_RECORDER is None:
+            self.write(json.dumps({'configured': False}))
+            return
+        self.write(json.dumps({'configured': True, **SPECTRUM_RECORDER.get_json()}))
+
+    async def post(self):
+        global SPECTRUM_RECORDER
+        params = json.loads(self.request.body)
+        ip = (params.get('ip') or '').strip()
+        if not ip:
+            self.set_status(400)
+            self.write(json.dumps({'error': 'ip is required'}))
+            return
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            self.set_status(400)
+            self.write(json.dumps({'error': f'"{ip}" is not a valid IP address'}))
+            return
+        if SPECTRUM_RECORDER is not None:
+            await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, SPECTRUM_RECORDER.disconnect)
+        SPECTRUM_RECORDER = rfvenue.RFVenueSpectrumRecorder(ip)
+        await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, SPECTRUM_RECORDER.connect)
+        save_spectrum_recorder_ip(ip)
+        self.write(json.dumps({'configured': True, **SPECTRUM_RECORDER.get_json()}))
+
+    async def delete(self):
+        global SPECTRUM_RECORDER
+        if SPECTRUM_RECORDER is not None:
+            await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, SPECTRUM_RECORDER.disconnect)
+            SPECTRUM_RECORDER = None
+        save_spectrum_recorder_ip(None)
+        self.write(json.dumps({'configured': False}))
+
+async def spectrum_recorder_tick():
+    """Self-rescheduling, same call_later pattern as poll_devices()/
+    auto_discovery_tick()/prune_metrics_tick(). Only ever touches
+    SPECTRUM_RECORDER's own re-read (poll()) -- if it's gone DISCONNECTED
+    (device off/unreachable), retries connect() at the same cadence rather
+    than needing a human to re-enter the IP, matching _poll_one_device's
+    auto-reconnect behavior for mic/IEM devices."""
+    if SPECTRUM_RECORDER is not None:
+        try:
+            if SPECTRUM_RECORDER.status != 'CONNECTED':
+                await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, SPECTRUM_RECORDER.connect)
+            else:
+                await IOLoop.current().run_in_executor(DEVICE_EXECUTOR, SPECTRUM_RECORDER.poll)
+        except Exception as e:
+            print(f"spectrum_recorder_tick failed: {e}")
+    IOLoop.current().call_later(rfvenue.POLL_INTERVAL_SECONDS, lambda: IOLoop.current().spawn_callback(spectrum_recorder_tick))
+
 _last_webhook_sent = {}
 WEBHOOK_COOLDOWN_SECONDS = 60
 
@@ -1846,7 +1911,8 @@ def load_full_config():
     DEFAULT_LOCATION here so nothing already on a user's board silently
     disappears when this ships."""
     if not os.path.exists(CONFIG_PATH):
-        return {'devices': [], 'active_location': DEFAULT_LOCATION, 'locations': [DEFAULT_LOCATION], 'ignored_ips': []}
+        return {'devices': [], 'active_location': DEFAULT_LOCATION, 'locations': [DEFAULT_LOCATION],
+                'ignored_ips': [], 'spectrum_recorder_ip': None}
     with open(CONFIG_PATH, 'r') as f:
         cfg = json.load(f)
     devices = cfg.get('devices', [])
@@ -1869,6 +1935,8 @@ def load_full_config():
         # this (explicit intent wins), and registering a device for real
         # clears it from here -- see register_device_channels().
         'ignored_ips': cfg.get('ignored_ips', []),
+        # Board-wide, not per-location -- see SPECTRUM_RECORDER's comment.
+        'spectrum_recorder_ip': cfg.get('spectrum_recorder_ip'),
     }
 
 def load_config():
@@ -1909,6 +1977,12 @@ def remove_ignored_ip(ip):
 
 def is_ignored_ip(ip):
     return ip in load_full_config()['ignored_ips']
+
+def save_spectrum_recorder_ip(ip):
+    full = load_full_config()
+    full['spectrum_recorder_ip'] = ip
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(full, f, indent=2)
 
 # Every config.json entry is identified by (ip, channel, location), not
 # just (ip, channel) -- a multi-channel receiver has several entries
@@ -2123,19 +2197,25 @@ def main():
         (r'/coordination/check', CoordinationCheckHandler),
         (r'/coordination/suggest', CoordinationSuggestHandler),
         (r'/coordination/scan-exclusions', ScanExclusionsHandler),
+        (r'/spectrum-recorder', SpectrumRecorderHandler),
         (r'/static/(.*)', StaticHandler),
     ])
     app.listen(9000, address='0.0.0.0')
-    global ACTIVE_LOCATION
+    global ACTIVE_LOCATION, SPECTRUM_RECORDER
     full_cfg = load_full_config()
     ACTIVE_LOCATION = full_cfg['active_location']
     IOLoop.current().run_sync(lambda: _load_location(ACTIVE_LOCATION, full_cfg['devices']))
+
+    if full_cfg['spectrum_recorder_ip']:
+        SPECTRUM_RECORDER = rfvenue.RFVenueSpectrumRecorder(full_cfg['spectrum_recorder_ip'])
+        IOLoop.current().run_sync(lambda: IOLoop.current().run_in_executor(DEVICE_EXECUTOR, SPECTRUM_RECORDER.connect))
 
     _sap_listener.start()
     start_passive_discovery()
     IOLoop.current().spawn_callback(poll_devices)
     IOLoop.current().spawn_callback(auto_discovery_tick)
     IOLoop.current().spawn_callback(prune_metrics_tick)
+    IOLoop.current().spawn_callback(spectrum_recorder_tick)
     print(f"OmniWave OS v{VERSION} running on 0.0.0.0:9000...")
     IOLoop.current().start()
 

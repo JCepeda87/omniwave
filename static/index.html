@@ -520,6 +520,22 @@
     </div>
   </details>
 
+  <details class="panel">
+    <summary>Spectrum Analyzer</summary>
+    <div class="details-body">
+      <div class="device-meta" style="margin-bottom:10px">
+        An RF Venue Spectrum Recorder on the network, read over its own built-in file share (not the live
+        push API, which RF Venue only hands out on request -- see its "Last updated" timestamp below; this
+        updates roughly every 10 minutes, matching the hardware's own aggregation cycle, not a live feed).
+      </div>
+      <form class="add-device" id="spectrumRecorderForm">
+        <input name="ip" id="spectrumRecorderIp" placeholder="Spectrum Recorder IP, e.g. 192.168.1.80" required>
+        <button type="submit">Connect</button>
+      </form>
+      <div id="spectrumRecorderStatus" style="margin-top:10px"></div>
+    </div>
+  </details>
+
   <div class="panel">
     <div class="panel-head-row">
       <h2>Devices</h2>
@@ -801,11 +817,79 @@ async function toggleAutoDiscovery() {
   renderAutoDiscoveryToggle(res.enabled);
 }
 
+async function loadSpectrumRecorder() {
+  const res = await fetch('/spectrum-recorder').then(r => r.json());
+  renderSpectrumRecorderStatus(res);
+}
+
+function renderSpectrumRecorderStatus(res) {
+  const el = document.getElementById('spectrumRecorderStatus');
+  const form = document.getElementById('spectrumRecorderForm');
+  if (!res.configured) {
+    el.innerHTML = '';
+    form.querySelector('button').textContent = 'Connect';
+    return;
+  }
+  form.querySelector('[name="ip"]').value = res.ip;
+  form.querySelector('button').textContent = 'Update';
+  const updated = res.last_updated
+    ? new Date(res.last_updated * 1000).toLocaleTimeString()
+    : 'never';
+  const view = document.getElementById('spectrumRecorderView');
+  const field = (view && view.value) || 'spectrum';
+  const spectrum = res[field] || [];
+  el.innerHTML = `
+    <div class="status-line ${res.status}"><span class="status-dot ${res.status}"></span>${res.status}
+      <button class="danger" style="margin-left:10px" onclick="disconnectSpectrumRecorder()">Remove</button>
+    </div>
+    ${res.last_error ? `<div class="device-meta" style="color:var(--warn)">${res.last_error}</div>` : ''}
+    <div class="device-meta" style="margin:6px 0">
+      Last updated: ${updated}
+      <select id="spectrumRecorderView" onchange="renderSpectrumRecorderStatus(lastSpectrumRecorderState)" style="margin-left:8px">
+        <option value="spectrum" ${field === 'spectrum' ? 'selected' : ''}>Max Hold (recommended for exclusions)</option>
+        <option value="spectrum_avg" ${field === 'spectrum_avg' ? 'selected' : ''}>Average</option>
+        <option value="spectrum_active" ${field === 'spectrum_active' ? 'selected' : ''}>Active (Max Hold − Average)</option>
+      </select>
+    </div>
+    ${spectrum.length
+      ? `<div class="spectrum" style="height:60px">${renderSpectrum(spectrum)}</div>`
+      : '<div class="empty">No scan data yet.</div>'}`;
+  lastSpectrumRecorderState = res;
+}
+
+let lastSpectrumRecorderState = { configured: false };
+
+document.getElementById('spectrumRecorderForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const ip = document.getElementById('spectrumRecorderIp').value.trim();
+  if (!ip) return;
+  document.getElementById('spectrumRecorderStatus').innerHTML = '<div class="device-meta">Connecting...</div>';
+  const res = await fetch('/spectrum-recorder', {
+    method: 'POST',
+    body: JSON.stringify({ ip }),
+  }).then(r => r.json());
+  renderSpectrumRecorderStatus(res);
+});
+
+async function disconnectSpectrumRecorder() {
+  const res = await fetch('/spectrum-recorder', { method: 'DELETE' }).then(r => r.json());
+  document.getElementById('spectrumRecorderForm').reset();
+  renderSpectrumRecorderStatus(res);
+}
+
 function renderSpectrum(spectrum) {
   if (!spectrum || !spectrum.length) return '';
-  const max = Math.max(...spectrum.map(p => p[1]), 1);
+  // Min-max normalized, not just scaled against the max -- a plain
+  // value/max scale silently breaks for dBm readings (always negative:
+  // e.g. an RF Venue Spectrum Recorder's -110..-20 range), since max of
+  // an all-negative array is < 0 and every bar comes out a negative,
+  // invisible height. Min-max works for any real range, negative or not.
+  const levels = spectrum.map(p => p[1]);
+  const max = Math.max(...levels);
+  const min = Math.min(...levels);
+  const range = (max - min) || 1;
   return spectrum.map(p =>
-    `<div style="height:${Math.max(4, (p[1] / max) * 36)}px" title="${p[0]} MHz: ${p[1]}"></div>`
+    `<div style="height:${Math.max(4, ((p[1] - min) / range) * 36)}px" title="${p[0]} MHz: ${p[1]}"></div>`
   ).join('');
 }
 
@@ -2117,12 +2201,17 @@ async function switchLocation(name) {
 loadLocations();
 loadRegions();
 loadAutoDiscoveryState();
+loadSpectrumRecorder();
 renderScanExclusionChips();
 renderManualExclusionChips();
 refresh();
 // Matches the backend's poll_devices() cadence (omniwave.py) so the audio
 // meter reads as live rather than visibly stepping.
 setInterval(refresh, 500);
+// Matches the backend's own rfvenue.POLL_INTERVAL_SECONDS -- the device
+// itself only updates its aggregate files every 10 minutes, so polling
+// faster than this would just re-fetch identical data.
+setInterval(loadSpectrumRecorder, 60000);
 </script>
 </body>
 </html>
