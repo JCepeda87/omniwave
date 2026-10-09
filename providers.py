@@ -461,8 +461,25 @@ class UHFRProvider(BaseProvider):
             try:
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 self.sock.settimeout(0.5)
-                # UDP has no handshake -- poll() confirms real reachability
-                # by tracking consecutive misses, not by trusting socket().
+                # UDP's socket() call itself never fails even when nothing's
+                # listening -- connecting always "succeeded" by that measure
+                # alone, which made every automatic reconnect retry (see
+                # omniwave.py's _poll_one_device) flash this device CONNECTED
+                # for a few seconds before poll()'s own miss-counting caught
+                # back up and flipped it back, on *every single retry* for a
+                # device that's genuinely unreachable -- confirmed live: a
+                # laptop with no path to these units at all showed every
+                # UHF-R channel cycling CONNECTED/DISCONNECTED every ~5s,
+                # in lockstep with the reconnect interval. A real round-trip
+                # here, same pattern SennheiserSSCProvider already uses for
+                # the identical reason, means a genuinely unreachable device
+                # now correctly stays DISCONNECTED through a failed retry
+                # instead of cosmetically flashing CONNECTED first.
+                self._send(f'* GET {self.channel} CHAN_NAME *')
+                replies = self._read_messages(timeout=0.5)
+                if not replies:
+                    self.status = 'DISCONNECTED'
+                    return
                 self.status = 'CONNECTED'
                 self._metering_started = False
                 self._miss_count = 0
@@ -1500,16 +1517,26 @@ class SennheiserG4Provider(BaseProvider):
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 self.sock.settimeout(0.5)
                 self.sock.connect((self.ip, G4_PORT))
-                self.status = 'CONNECTED'
                 self._buffer = ''
-                self._miss_count = 0
                 self._send(f'Push {G4_PUSH_TIMEOUT_SEC} {G4_PUSH_CYCLIC_MS} 3\r')
                 self._last_push_sent = time.time()
                 self._send('Name\r')
                 self._send('FirmwareRevision\r')
                 self._send('Frequency\r')
                 self._send('Mute\r')
-                for line in self._read_messages(timeout=0.5):
+                lines = self._read_messages(timeout=0.5)
+                # UDP's connect() call itself never fails even when nothing's
+                # listening -- same real-round-trip-or-stay-DISCONNECTED fix
+                # as UHFRProvider.connect() just above, for the identical
+                # reason: every automatic reconnect retry otherwise flashes
+                # a genuinely unreachable unit CONNECTED for a few seconds
+                # before poll()'s own miss-counting catches back up.
+                if not lines:
+                    self.status = 'DISCONNECTED'
+                    return
+                self.status = 'CONNECTED'
+                self._miss_count = 0
+                for line in lines:
                     self._apply_line(line)
             except Exception:
                 self.status = 'DISCONNECTED'
