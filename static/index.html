@@ -1280,7 +1280,11 @@ function renderLayoutBoard(data) {
     const size = ['sm', 'md', 'lg'].includes(d.card_size) ? d.card_size : 'md';
     const visible = d.visible_on_board !== false;
     const thumbStyle = d.photo ? `style="background-image:url('${d.photo}')"` : '';
-    const thumbContent = d.photo ? '' : '🎤';
+    // Mirrors the User Board's own placeholder (static/user.html) -- a
+    // receiver (picks up a body-worn mic) vs a transmitter (an IEM
+    // beltpack feeding a performer's in-ear mix), so this layout panel's
+    // thumbnail previews what the actual board will show.
+    const thumbContent = d.photo ? '' : (d.role === 'transmitter' ? '🎧' : '🎤');
     return `
       <div class="layout-card ${visible ? '' : 'layout-card-hidden'}" draggable="true" data-ip="${ip}"
            ondragstart="layoutDragStart(event, '${ip}')" ondragend="layoutDragEnd(event)"
