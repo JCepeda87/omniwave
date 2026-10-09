@@ -282,7 +282,13 @@ function renderBoard(data) {
     const unitName = d.name || d.type || ip;
     const cardSize = ['sm', 'md', 'lg'].includes(d.card_size) ? d.card_size : 'md';
     const photoStyle = d.photo ? `style="background-image:url('${d.photo}')"` : '';
-    const placeholder = d.photo ? '' : '<div class="uphoto-placeholder">🎤</div>';
+    // Receiver (picks up RF from a body-worn mic/instrument transmitter) vs
+    // transmitter (an IEM beltpack feeding a performer's in-ear mix) --
+    // same role distinction the urole-badge below already shows, just also
+    // reflected in the placeholder itself so an unphotographed card still
+    // reads as "mic" vs "pack" at a glance.
+    const placeholderIcon = d.role === 'transmitter' ? '🎧' : '🎤';
+    const placeholder = d.photo ? '' : `<div class="uphoto-placeholder">${placeholderIcon}</div>`;
     const assignedRow = editingUser.has(ip) ? `
               <input type="text" class="uassigned-input" id="userEdit-${CSS.escape(ip)}" value="${escAttr(d.assigned_user || '')}"
                 onkeydown="if(event.key==='Enter'){saveUserEdit('${ip}', this.value);} else if(event.key==='Escape'){cancelUserEdit('${ip}');}">
