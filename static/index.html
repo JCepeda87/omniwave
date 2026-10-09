@@ -1570,10 +1570,15 @@ function renderRfPlot(data) {
       const hasValue = rf !== undefined && rf !== null;
       const pct = hasValue ? rfDisplayPct(rf) : 0;
       const low = hasValue && rfIsLow(rf);
+      // Same role distinction as the User Board's placeholder (mic for a
+      // receiver picking up a body-worn mic, headphones for an IEM
+      // transmitter feeding a performer's in-ear mix) -- a quick visual
+      // sort of the plot without reading every label.
+      const roleIcon = d.role === 'transmitter' ? '🎧' : '🎤';
       const label = (d.name || ip) + (d.channel ? ` · ch ${d.channel}` : '');
       return `
         <div class="rf-plot-row">
-          <div class="rf-plot-label" title="${escAttr(label)}">${label}</div>
+          <div class="rf-plot-label" title="${escAttr(label)}">${roleIcon} ${label}</div>
           <div class="rf-plot-bar-track"><div class="rf-plot-bar-fill ${hasValue ? (low ? 'low' : '') : 'none'}" style="width:${pct}%"></div></div>
           <div class="rf-plot-val">${hasValue ? rf : '—'}</div>
         </div>`;
