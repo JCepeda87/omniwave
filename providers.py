@@ -176,6 +176,9 @@ class ShureProvider(BaseProvider):
                 self._miss_count = 0
                 self._query_dante_status()
             except Exception:
+                if self.sock:
+                    try: self.sock.close()
+                    except Exception: pass
                 self.status = 'DISCONNECTED'
 
     def _query_dante_status(self):
@@ -493,12 +496,30 @@ class UHFRProvider(BaseProvider):
                 self._send(f'* GET {self.channel} CHAN_NAME *')
                 replies = self._read_messages(timeout=0.5)
                 if not replies:
+                    # Closes the socket this very call just opened, rather
+                    # than leaving it for the NEXT connect() to silently
+                    # abandon -- missed on the first pass of this fix: a
+                    # device that keeps failing this check (the common case
+                    # for one that's genuinely down) never reaches
+                    # _mark_unreachable()'s own cleanup at all, so every
+                    # failed 5s retry leaked one more socket, for as long as
+                    # it stayed unreachable. Confirmed as the real cause of
+                    # this app silently losing all LAN connectivity after
+                    # running a while with devices stuck disconnected.
+                    try: self.sock.close()
+                    except Exception: pass
                     self.status = 'DISCONNECTED'
                     return
                 self.status = 'CONNECTED'
                 self._metering_started = False
                 self._miss_count = 0
             except Exception:
+                # Covers a real exception during send/recv above (e.g. the
+                # network dropping mid-attempt) -- same leak as the ifs
+                # not-replies branch just above, different trigger.
+                if self.sock:
+                    try: self.sock.close()
+                    except Exception: pass
                 self.status = 'DISCONNECTED'
 
     def disconnect(self):
@@ -729,12 +750,26 @@ class PSM1000Provider(BaseProvider):
                 # "is it actually going to talk to us" signal, same
                 # principle as UHFRProvider/SennheiserG4Provider's connect().
                 if not self._read_messages(timeout=0.5):
+                    # See UHFRProvider.connect()'s identical fix above for
+                    # why this close() matters: without it, a unit stuck
+                    # failing this exact check (confirmed live: this one
+                    # accepting a connection then immediately dropping it)
+                    # leaks one socket per failed 5s retry, forever, since
+                    # _mark_unreachable() is never reached from this path.
+                    try: self.sock.close()
+                    except Exception: pass
                     self.status = 'DISCONNECTED'
                     return
                 self.status = 'CONNECTED'
                 self._miss_count = 0
                 self._queried_static = False
             except Exception:
+                # Covers a real exception during connect/send/recv above --
+                # same leak as the not-replies branch just above, different
+                # trigger (e.g. the network dropping mid-attempt).
+                if self.sock:
+                    try: self.sock.close()
+                    except Exception: pass
                 self.status = 'DISCONNECTED'
 
     def _mark_unreachable(self):
@@ -885,6 +920,9 @@ class SLXDProvider(BaseProvider):
                 self._miss_count = 0
                 self._query_rf_band()
             except Exception:
+                if self.sock:
+                    try: self.sock.close()
+                    except Exception: pass
                 self.status = 'DISCONNECTED'
 
     def _query_rf_band(self):
@@ -1099,6 +1137,9 @@ class AxientDigitalProvider(BaseProvider):
                 self._query_rf_band()
                 self._query_dante_status()
             except Exception:
+                if self.sock:
+                    try: self.sock.close()
+                    except Exception: pass
                 self.status = 'DISCONNECTED'
 
     def _query_rf_band(self):
@@ -1333,6 +1374,9 @@ class MXWProvider(BaseProvider):
                 self._buffer = ''
                 self._miss_count = 0
             except Exception:
+                if self.sock:
+                    try: self.sock.close()
+                    except Exception: pass
                 self.status = 'DISCONNECTED'
 
     def _mark_unreachable(self):
@@ -1582,6 +1626,12 @@ class SennheiserG4Provider(BaseProvider):
                 # a genuinely unreachable unit CONNECTED for a few seconds
                 # before poll()'s own miss-counting catches back up.
                 if not lines:
+                    # See UHFRProvider.connect()'s identical fix above --
+                    # without this, a unit stuck failing this check leaks
+                    # one socket per failed 5s retry, forever, since
+                    # _mark_unreachable() is never reached from this path.
+                    try: self.sock.close()
+                    except Exception: pass
                     self.status = 'DISCONNECTED'
                     return
                 self.status = 'CONNECTED'
@@ -1589,6 +1639,11 @@ class SennheiserG4Provider(BaseProvider):
                 for line in lines:
                     self._apply_line(line)
             except Exception:
+                # Covers a real exception during send/recv above -- same
+                # leak as the not-lines branch just above, different trigger.
+                if self.sock:
+                    try: self.sock.close()
+                    except Exception: pass
                 self.status = 'DISCONNECTED'
 
     def _mark_unreachable(self):
@@ -1832,6 +1887,13 @@ class SennheiserSSCProvider(BaseProvider):
                 }})
                 replies = self._read_messages(timeout=0.6, stop_early=False)
                 if not replies:
+                    # Closes the socket this call just opened -- same
+                    # leak-on-every-failed-retry gap as every other
+                    # provider's connect() (see UHFRProvider's comment for
+                    # the full explanation); this one predates those
+                    # fixes, found while auditing every connect() for it.
+                    try: self.sock.close()
+                    except Exception: pass
                     self.status = 'DISCONNECTED'
                     return
                 self.status = 'CONNECTED'
@@ -1873,6 +1935,9 @@ class SennheiserSSCProvider(BaseProvider):
                     'ip': dante_ip,
                 }
             except Exception:
+                if self.sock:
+                    try: self.sock.close()
+                    except Exception: pass
                 self.status = 'DISCONNECTED'
 
     @staticmethod
@@ -2080,6 +2145,14 @@ class SennheiserEWDXProvider(BaseProvider):
                         self.model = product
                 r = self.session.get(f'{self._base_url()}/api/channel/{self._channel_id()}', timeout=EWDX_REQUEST_TIMEOUT)
                 if r.status_code == 401:
+                    # Closes the Session (and the real connection(s) it
+                    # holds internally) this call just opened, rather than
+                    # leaving it for the NEXT connect() to abandon -- same
+                    # leak-on-every-failed-retry fix as every socket-based
+                    # provider's connect() above, just a Session instead of
+                    # a bare socket here.
+                    try: self.session.close()
+                    except Exception: pass
                     self.status = 'DISCONNECTED'
                     self.last_command_error = "Device rejected the 3rd-party password"
                     return
@@ -2088,6 +2161,9 @@ class SennheiserEWDXProvider(BaseProvider):
                 self._miss_count = 0
                 self._queried_static = False
             except requests.RequestException:
+                if self.session:
+                    try: self.session.close()
+                    except Exception: pass
                 self.status = 'DISCONNECTED'
 
     def disconnect(self):
