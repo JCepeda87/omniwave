@@ -715,8 +715,23 @@ class PSM1000Provider(BaseProvider):
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sock.settimeout(0.5)
                 self.sock.connect((self.ip, 2202))
-                self.status = 'CONNECTED'
                 self._buffer = ''
+                # A successful TCP handshake isn't actually proof the unit
+                # will talk to us -- confirmed live: this device accepting
+                # the connection and then immediately closing it (recv()
+                # returning b'', not a timeout) is a real, reproducible
+                # state it can get stuck in, and declaring CONNECTED on the
+                # handshake alone made every automatic reconnect retry
+                # flicker this unit CONNECTED for a moment before the very
+                # next poll found nothing to read. This is a push protocol
+                # (see the module comment above) -- waiting here for the
+                # unit's own unsolicited first REPORT is the only honest
+                # "is it actually going to talk to us" signal, same
+                # principle as UHFRProvider/SennheiserG4Provider's connect().
+                if not self._read_messages(timeout=0.5):
+                    self.status = 'DISCONNECTED'
+                    return
+                self.status = 'CONNECTED'
                 self._miss_count = 0
                 self._queried_static = False
             except Exception:
