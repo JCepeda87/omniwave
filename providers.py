@@ -195,6 +195,16 @@ class ShureProvider(BaseProvider):
             pass
 
     def _mark_unreachable(self):
+        # Closes the now-stale socket before the next connect() call
+        # overwrites this reference -- without it, a device that only
+        # accepts one client (confirmed live: a real PSM1000 started
+        # silently refusing every new connection after several
+        # reconnect cycles piled up unclosed old sockets it still
+        # considered open) can end up permanently unreachable through
+        # no fault of the network -- just this app never hanging up.
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
         self.status = 'DISCONNECTED'
         self.metrics = {}
         self._metering_started = False
@@ -451,6 +461,11 @@ class UHFRProvider(BaseProvider):
         self._miss_count = 0
 
     def _mark_unreachable(self):
+        # Closes the stale sock before connect() overwrites it -- see
+        # ShureProvider._mark_unreachable() above for why.
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
         self.status = 'DISCONNECTED'
         self.metrics = {}
         self._metering_started = False
@@ -708,6 +723,11 @@ class PSM1000Provider(BaseProvider):
                 self.status = 'DISCONNECTED'
 
     def _mark_unreachable(self):
+        # Closes the stale sock before connect() overwrites it -- see
+        # ShureProvider._mark_unreachable() above for why.
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
         self.status = 'DISCONNECTED'
         self.metrics = {}
         self._miss_count = 0
@@ -869,6 +889,11 @@ class SLXDProvider(BaseProvider):
             pass
 
     def _mark_unreachable(self):
+        # Closes the stale sock before connect() overwrites it -- see
+        # ShureProvider._mark_unreachable() above for why.
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
         self.status = 'DISCONNECTED'
         self.metrics = {}
         self._metering_started = False
@@ -1087,6 +1112,11 @@ class AxientDigitalProvider(BaseProvider):
             pass
 
     def _mark_unreachable(self):
+        # Closes the stale sock before connect() overwrites it -- see
+        # ShureProvider._mark_unreachable() above for why.
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
         self.status = 'DISCONNECTED'
         self.metrics = {}
         self._metering_started = False
@@ -1291,6 +1321,11 @@ class MXWProvider(BaseProvider):
                 self.status = 'DISCONNECTED'
 
     def _mark_unreachable(self):
+        # Closes the stale sock before connect() overwrites it -- see
+        # ShureProvider._mark_unreachable() above for why.
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
         self.status = 'DISCONNECTED'
         self.metrics = {}
         self._metering_started = False
@@ -1542,6 +1577,11 @@ class SennheiserG4Provider(BaseProvider):
                 self.status = 'DISCONNECTED'
 
     def _mark_unreachable(self):
+        # Closes the stale sock before connect() overwrites it -- see
+        # ShureProvider._mark_unreachable() above for why.
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
         self.status = 'DISCONNECTED'
         self.metrics = {}
         self._miss_count = 0
@@ -1738,6 +1778,11 @@ class SennheiserSSCProvider(BaseProvider):
         return f'tx{self.channel}'
 
     def _mark_unreachable(self):
+        # Closes the stale sock before connect() overwrites it -- see
+        # ShureProvider._mark_unreachable() above for why.
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
         self.status = 'DISCONNECTED'
         self.metrics = {}
         self._miss_count = 0
@@ -2102,6 +2147,11 @@ class SennheiserEWDXProvider(BaseProvider):
                 self._mark_unreachable()
 
     def _mark_unreachable(self):
+        # Closes the stale session before connect() overwrites it -- see
+        # ShureProvider._mark_unreachable() above for why.
+        if self.session:
+            try: self.session.close()
+            except Exception: pass
         self.status = 'DISCONNECTED'
         self.metrics = {}
         self._miss_count = 0
