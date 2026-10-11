@@ -998,31 +998,44 @@ def scan_subnet():
                 found.append({'ip': ip, 'brand': brand, 'port': port})
     return found
 
+UDP_PROBE_ATTEMPTS = 2  # see _udp_probe()'s docstring
+
+def _udp_probe(ip, port, payload):
+    """Sends `payload` and waits up to DISCOVERY_TIMEOUT for any reply,
+    retrying up to UDP_PROBE_ATTEMPTS times on a fresh send before giving
+    up. UDP has no retransmission of its own (unlike probe_host()'s TCP
+    connect_ex, which gets the kernel's own SYN retries for free) -- a
+    single dropped or delayed packet under DISCOVERY_MAX_WORKERS-way
+    concurrent load reads as "device not found" with only one attempt,
+    confirmed live: a real UHF-R unit that answered an isolated probe
+    instantly was missing from a full scan's results. Re-sending on the
+    same socket rather than opening a new one each attempt."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(DISCOVERY_TIMEOUT)
+            for attempt in range(UDP_PROBE_ATTEMPTS):
+                try:
+                    s.sendto(payload, (ip, port))
+                    s.recvfrom(4096)
+                    return True
+                except OSError:
+                    if attempt == UDP_PROBE_ATTEMPTS - 1:
+                        raise
+    except OSError:
+        return False
+    return False
+
 def probe_host_udp_uhfr(ip):
     """UHF-R only responds over UDP -- a plain TCP connect_ex() (scan_subnet's
     check) never sees it, since UDP has no equivalent "is it listening"
     probe short of actually speaking the protocol."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.settimeout(DISCOVERY_TIMEOUT)
-            s.sendto(b'* GET 1 CHAN_NAME *', (ip, 2202))
-            s.recvfrom(4096)
-        return True
-    except OSError:
-        return False
+    return _udp_probe(ip, 2202, b'* GET 1 CHAN_NAME *')
 
 def probe_host_udp_g4(ip):
     """ew G4 stationary units also only respond over UDP (port 53212, ASCII
     Media control protocol -- see identify_device()) -- same reasoning as
     the UHF-R probe above, just a different port/protocol."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.settimeout(DISCOVERY_TIMEOUT)
-            s.sendto(b'FirmwareRevision\r', (ip, 53212))
-            s.recvfrom(4096)
-        return True
-    except OSError:
-        return False
+    return _udp_probe(ip, 53212, b'FirmwareRevision\r')
 
 def probe_host_udp_ssc(ip):
     """Sennheiser SSC's mandatory transport is UDP (port 45) -- TCP is an
@@ -1030,14 +1043,7 @@ def probe_host_udp_ssc(ip):
     (EM 6000/L 6000) implements ONLY UDP (confirmed live: a real EM 6000
     never answered scan_subnet()'s TCP-45 probe at all). Without this,
     scan_subnet()'s TCP-only check silently drops every UDP-only SSC unit."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.settimeout(DISCOVERY_TIMEOUT)
-            s.sendto(b'{"device":{"identity":{"product":null}}}', (ip, 45))
-            s.recvfrom(4096)
-        return True
-    except OSError:
-        return False
+    return _udp_probe(ip, 45, b'{"device":{"identity":{"product":null}}}')
 
 def scan_subnet_udp():
     """Blocking; call via an executor. Finds UDP-only hosts (UHF-R, ew G4,
